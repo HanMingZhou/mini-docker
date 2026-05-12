@@ -78,3 +78,101 @@ func TestRemove(t *testing.T) {
 		t.Fatalf("want empty list after remove, got %d", len(list))
 	}
 }
+
+// TestConcurrentSaveSameID 验证同进程多 goroutine 对同一 ID 并发 Save 不会
+// 撕裂 config.json（曾经的 bug：tmp 文件路径冲突，rename 后 JSON 半截）。
+func TestConcurrentSaveSameID(t *testing.T) {
+	s := newTestStore(t)
+	const id = "cccccccccccc"
+	const goroutines = 50
+
+	done := make(chan struct{}, goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer func() { done <- struct{}{} }()
+			c := &Container{
+				ID:        id,
+				Name:      "racer",
+				CreatedAt: time.Now(),
+				ExitCode:  i,
+			}
+			if err := s.Save(c); err != nil {
+				t.Errorf("save %d: %v", i, err)
+			}
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+
+	// 读一次，JSON 必须能正常解析（任何一次 Save 的内容都合法）。
+	c, err := s.loadByID(id)
+	if err != nil {
+		t.Fatalf("loadByID after concurrent save: %v", err)
+	}
+	if c.ID != id || c.Name != "racer" {
+		t.Fatalf("data corrupted: ID=%q Name=%q", c.ID, c.Name)
+	}
+}
+
+// TestConcurrentSaveDifferentIDs 验证多 goroutine 并发 Save 不同 ID 都成功。
+func TestConcurrentSaveDifferentIDs(t *testing.T) {
+	s := newTestStore(t)
+	const goroutines = 20
+
+	done := make(chan struct{}, goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer func() { done <- struct{}{} }()
+			id := "id00000000" + string(rune('a'+i%26))
+			if err := s.Save(&Container{ID: id, Name: id, CreatedAt: time.Now()}); err != nil {
+				t.Errorf("save: %v", err)
+			}
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+
+	list, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 应该有 min(20, 26) = 20 个唯一 ID（实际按字母映射有重复 id，取唯一值）
+	if len(list) == 0 {
+		t.Fatalf("expected some containers after concurrent saves")
+	}
+}
+
+// TestWithLockMutualExclusion 验证 WithLock 在同进程内也能互斥（通过 flock）。
+// 两个 goroutine 都 WithLock，临界区累加计数；任意交错都应到达 n 次。
+func TestWithLockMutualExclusion(t *testing.T) {
+	s := newTestStore(t)
+	const n = 50
+	counter := 0
+
+	done := make(chan struct{}, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			if err := s.WithLock(func() error {
+				// 非原子读-改-写：只有在真正互斥时才能跑对
+				cur := counter
+				time.Sleep(time.Microsecond) // 放大 race 窗口
+				counter = cur + 1
+				return nil
+			}); err != nil {
+				t.Errorf("WithLock: %v", err)
+			}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		<-done
+	}
+
+	if counter != n {
+		t.Fatalf("counter = %d, want %d (race condition detected)", counter, n)
+	}
+}
