@@ -148,7 +148,12 @@ func TestConcurrentSaveDifferentIDs(t *testing.T) {
 
 // TestWithLockMutualExclusion 验证 WithLock 在同进程内也能互斥（通过 flock）。
 // 两个 goroutine 都 WithLock，临界区累加计数；任意交错都应到达 n 次。
+//
+// 注意：WithLock 非 Linux 是 no-op，因此 race 无法消除，只在 Linux 测。
 func TestWithLockMutualExclusion(t *testing.T) {
+	if !hasFileLock {
+		t.Skip("WithLock is a no-op on this platform")
+	}
 	s := newTestStore(t)
 	const n = 50
 	counter := 0

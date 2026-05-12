@@ -9,6 +9,10 @@ import (
 	"syscall"
 )
 
+// hasFileLock 表明本平台 WithLock 是真实的 flock（非 no-op）。
+// 用于单元测试的条件编译。
+const hasFileLock = true
+
 // WithLock 在 <root>/.lock 上持有一把 flock 排他锁，执行 fn，然后释放。
 // 用于跨进程互斥（两个 mydocker CLI 进程同时 run --name web 之类）。
 //
