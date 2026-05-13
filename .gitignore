@@ -16,7 +16,6 @@ go.work.sum
 /var/
 
 # Rootfs / image artifacts (exported from docker, should never be committed)
-rootfs*/
 /images/
 *.tar
 *.tar.gz

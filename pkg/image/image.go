@@ -339,9 +339,9 @@ type RootfsPaths struct {
 // containerDir 约定为 <root>/containers/<id>。
 func ContainerRootfsPaths(containerDir string) RootfsPaths {
 	return RootfsPaths{
-		Upper:  filepath.Join(containerDir, "upper"),
-		Work:   filepath.Join(containerDir, "work"),
-		Merged: filepath.Join(containerDir, "merged"),
+		Upper:  filepath.Join(containerDir, "upper"),  // 容器独占可写层（空的，启动后容器写东西会填进来）
+		Work:   filepath.Join(containerDir, "work"),   // overlay 内部工作目录（别碰）
+		Merged: filepath.Join(containerDir, "merged"), // 最终给容器用的 / 根目录（挂载点）
 	}
 }
 
