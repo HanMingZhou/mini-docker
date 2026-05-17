@@ -167,6 +167,7 @@ func runContainer(o runOptions, cmdArgs []string) error {
 		if m, _ := is.Resolve(o.image); m != nil {
 			imageConfig = m.Config
 		}
+		// 返回mount挂载点
 		merged, err := is.PrepareRootfs(o.image, containerDir)
 		if err != nil {
 			return fmt.Errorf("prepare rootfs from image %s: %w", o.image, err)
@@ -193,6 +194,7 @@ func runContainer(o runOptions, cmdArgs []string) error {
 	}
 
 	// Network mode: bridge / host / none.
+	// Default mode: bridge
 	netMode := strings.ToLower(strings.TrimSpace(o.network))
 	if netMode == "" {
 		netMode = "bridge"

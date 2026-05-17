@@ -34,7 +34,9 @@ func prepareRootfs(s *Store, imageName, containerDir string) (string, error) {
 
 		data 字符串的结构
 			formatLowerDirs(layers) 把若干镜像层用冒号拼起来，上层在前、下层在后（这是 overlayfs 的约定）：
-			lowerdir=/var/lib/mydocker/images/layer4/content:/var/lib/mydocker/images/layer3/content:/var/lib/mydocker/images/layer2/content:/var/lib/mydocker/images/layer1/content,upperdir=/var/lib/mydocker/containers/abc/upper,workdir=/var/lib/mydocker/containers/abc/work
+			lowerdir=/var/lib/mydocker/images/layer4/content:/var/lib/mydocker/images/layer3/content:/var/lib/mydocker/images/layer2/content:/var/lib/mydocker/images/layer1/content
+			upperdir=/var/lib/mydocker/containers/abc/upper
+			workdir=/var/lib/mydocker/containers/abc/work
 
 		拆开看：
 			lowerdir=层4:层3:层2:层1    ← 查找顺序从左到右，越靠前优先级越高
