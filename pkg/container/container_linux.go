@@ -69,6 +69,7 @@ func start(cfg Config) (*Handle, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: cloneFlags,
 	}
+	// 把管道读端塞给子进程
 	cmd.ExtraFiles = []*os.File{r}
 
 	// stdio：detach -> 日志文件；前台 tty -> 当前终端；否则继承 stdout/err
@@ -117,6 +118,7 @@ func start(cfg Config) (*Handle, error) {
 		return nil, fmt.Errorf("start init process: %w", err)
 	}
 
+	// 创建 cgroup（写文件，比如 /sys/fs/cgroup/mydocker/<name>/）
 	cg, err := cgroup.NewWithConfig(cgroup.Config{
 		Name:   cgName,
 		Parent: cfg.CgroupParent,
@@ -127,12 +129,14 @@ func start(cfg Config) (*Handle, error) {
 		_ = w.Close()
 		return nil, fmt.Errorf("new cgroup manager: %w", err)
 	}
+	// Apply 写资源限制（内存上限、CPU 配额）
 	if err := cg.Apply(cfg.Resources); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cg.Destroy()
 		_ = w.Close()
 		return nil, fmt.Errorf("apply cgroup: %w", err)
 	}
+	// AddProc 把子进程 PID 写进 cgroup.procs 文件 —— 这一步必须在父进程做，因为子进程在新 PID namespace 里看不到自己的"真实 PID
 	if err := cg.AddProc(cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cg.Destroy()
@@ -142,6 +146,11 @@ func start(cfg Config) (*Handle, error) {
 
 	// 网络配置：此时 cmd 已启动，netns 存在；init 子进程正阻塞在 pipe 读上，
 	// 还没 exec 用户命令。这是调用 CNI ADD 的最佳时机。
+	/*
+		子进程已经有了独立的 netns（在 /proc/<pid>/ns/net），但里面只有 lo（loopback），没有真正的网卡。
+		父进程调 CNI 插件（比如 bridge），让插件在子进程的 netns 里造一对 veth、配 IP、加路由。
+		之所以必须现在做：子进程还没 exec，netns 是空的、安全的。等用户命令跑起来再改网络就晚了。
+	*/
 	var networkIP string
 	if cfg.NetworkSetup != nil {
 		netnsPath := fmt.Sprintf("/proc/%d/ns/net", cmd.Process.Pid)

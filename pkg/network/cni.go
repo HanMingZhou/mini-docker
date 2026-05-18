@@ -137,7 +137,7 @@ func (m *Manager) Setup(ctx context.Context, podID, netnsPath, ifName string, ex
 	return m.SetupWithPorts(ctx, podID, netnsPath, ifName, extraArgs, nil)
 }
 
-// SetupWithPorts 执行 CNI ADD 并携带端口映射（走 portmap 插件）。
+// SetupWithPorts 执行 CNI ADD 并携带端口映射（走 portmap 插件）
 func (m *Manager) SetupWithPorts(ctx context.Context, podID, netnsPath, ifName string, extraArgs [][2]string, ports []PortMapping) (ip string, err error) {
 	if !m.Ready() {
 		return "", nil

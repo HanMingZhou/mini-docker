@@ -55,7 +55,12 @@ func (m *Manager) start(md Metadata, opts StartOptions) (*Sandbox, error) {
 		return sb, nil
 	}
 
+	// 启动 pause 进程（核心）
 	cmd := exec.Command(m.selfExe, "sandbox-pause")
+	// CLONE_NEWUTS	创建新的 UTS namespace——容器可以有自己的 hostname
+	// CLONE_NEWIPC	创建新的 IPC namespace——隔离 System V IPC、POSIX 消息队列
+	// CLONE_NEWNET	创建新的 Network namespace——容器有独立的网卡、IP、路由表
+	// Setsid: true	让 pause 成为新 session leader，脱离父进程的终端会话。否则父 shell 退出时 systemd 会清理整个 session，连带杀死 pause
 	cloneFlags := uintptr(syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWNET)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: cloneFlags,

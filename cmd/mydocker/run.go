@@ -213,7 +213,7 @@ func runContainer(o runOptions, cmdArgs []string) error {
 
 	var (
 		cniMgr       *network.Manager
-		networkSetup func(string) (string, error)
+		networkSetup func(string) (string, error) // 父进程获取子进程的PID后拼接fmt.Sprintf("/proc/%d/ns/net", cmd.Process.Pid)
 	)
 	if netMode == "bridge" {
 		m, err := network.NewManager("", "", nil) // defaults: /etc/cni/net.d, /opt/cni/bin

@@ -114,13 +114,12 @@ default via 10.22.0.1 dev eth0      ← 出网走 bridge
 10.22.0.0/16 dev eth0 ...           ← 同 bridge 内的容器直连
 步骤 4：容器能 ping 通别的容器和网关
 容器 A（10.22.0.2）ping 容器 B（10.22.0.3）：
-
 A 的内核查路由表，发现 10.22.0.3 在 eth0 网段，直接发 ARP 找 B 的 MAC
 数据从 A 的 eth0 发出 → veth pair → 宿主机的 veth_host_A → bridge mydocker0
 bridge 看到目标 MAC，从 veth_host_B 发出
 veth pair 把数据送到 B 的 eth0
-容器到外网（如 ping 8.8.8.8）：
 
+容器到外网（如 ping 8.8.8.8）：
 容器路由表说默认走 10.22.0.1（bridge 的 IP）
 数据从 veth 出来，进 bridge
 bridge 把它当成"宿主机收到的本地包"，交给宿主机内核
@@ -130,11 +129,11 @@ bridge 把它当成"宿主机收到的本地包"，交给宿主机内核
 
 步骤 5：端口映射 -p 8080:80
 宿主机加一条 iptables DNAT 规则：
-
+```sh
 iptables -t nat -A PREROUTING -p tcp --dport 8080 \
     -j DNAT --to-destination 10.22.0.2:80
+```
 意思：所有从外面进来的、目标端口是 8080 的 TCP 包，改写目标地址为 10.22.0.2:80（容器 IP + 容器内端口），然后正常路由（最后通过 bridge → veth → 容器 eth0）。
-
 外面 curl http://192.168.252.2:8080：
 包到宿主机
 iptables PREROUTING 把目标改成 10.22.0.2:80
@@ -144,8 +143,7 @@ bridge 转发到对应 veth → 容器 eth0
 回包走反向路径，iptables 自动把源地址改回宿主机 IP，对外面透明。
 
 5. 项目代码的对应
-回到 
-run.go
+回到 run.go
  这段：
 ```go
 if netMode == "bridge" {
@@ -168,7 +166,6 @@ if netMode == "bridge" {
 我们没有手写所有那些 ip link add / ip route add / iptables 命令，而是用 CNI（Container Network Interface）这个标准接口。CNI 是 Kubernetes 主推的网络抽象——插件负责具体怎么建 veth、配 IP，调用方只负责告诉插件"给这个 netns 配网"。
 
 SetupWithPorts 内部做了这几件事：
-
 读 /etc/cni/net.d/*.conflist 配置（哪个 bridge、IP 段、子网掩码）
 调用 CNI 插件二进制 /opt/cni/bin/bridge：
 建 veth pair
@@ -195,12 +192,12 @@ SetupWithPorts 内部做了这几件事：
    │      8080 → 10.22.0.2:80                                    │
    │      │                                                      │
    │      ▼                                                      │
-   │   路由表：10.22.0.0/16 → mydocker0                           │
+   │   路由表：10.22.0.0/16 → mydocker0                            │
    │      │                                                      │
    │      ▼                                                      │
    │  ╔═══════════════════════════════╗                          │
    │  ║   mydocker0 bridge            ║                          │
-   │  ║   IP: 10.22.0.1（容器网关）    ║                          │
+   │  ║   IP: 10.22.0.1（容器网关）    ║                            │
    │  ╚═══════════════════════════════╝                          │
    │   │ veth_host_A   │ veth_host_B                             │
    │   │               │                                         │
@@ -252,9 +249,7 @@ $ ip link add veth_host type veth peer name veth_container
 
 1. veth、eth0、veth_host 是什么关系
 先讲"网卡"这个抽象：
-
 网卡（network interface） = Linux 里能收发网络数据的设备，每张网卡：
-
 有一个名字（如 eth0、lo、wlan0）
 可能有一个 MAC 地址
 可能有一个或多个 IP 地址
@@ -317,7 +312,7 @@ $ nsenter --net=/proc/<pid>/ns/net ip link show
 5: eth0@if4: ...        ← @if4 对应宿主机那头的 ifindex
 @ifN 这个标记就是告诉你"对端的 ifindex 是多少"，能配对查到。
 
-2. 是的，宿主机上会有很多 veth
+2. 宿主机上会有很多 veth
 跑 N 个 bridge 容器 → 宿主机上有 N 条 veth pair → 宿主机能看到 N 个 veth（每对的另一头都跑到对应容器的 netns 里去了）。
 
 # 宿主机起了 3 个容器
@@ -341,17 +336,16 @@ veth 是成对绑定的，一端消失，另一端自动消失
 
 3. MASQUERADE 是什么时候改源 IP 的
 先讲 MASQUERADE 这条规则本身。CNI bridge 插件初始化时（或者你手动）会下一条：
-
+```shell
 iptables -t nat -A POSTROUTING -s 10.22.0.0/16 ! -o mydocker0 -j MASQUERADE
+```
 读起来：
-
 -t nat：操作 nat 表
 -A POSTROUTING：追加到 POSTROUTING 链（包离开本机前的最后一道）
 -s 10.22.0.0/16：源地址是容器网段
 ! -o mydocker0：出去的网卡不是 mydocker0（也就是要出宿主机的包）
 -j MASQUERADE：执行 MASQUERADE 动作（自动把源 IP 改成出口网卡的 IP）
 翻译成大白话：
-
 "如果一个包的源地址是 10.22.0.x（来自某个容器），并且它要从 mydocker0 以外的网卡出去（比如要走 eth0 出宿主机）——把它的源地址改成那张出口网卡的 IP。"
 
 触发时机：包穿过 netfilter 的 POSTROUTING 钩子时
@@ -364,20 +358,20 @@ iptables -t nat -A POSTROUTING -s 10.22.0.0/16 ! -o mydocker0 -j MASQUERADE
                   │
                   │  ┌─ 决策：这个包是给本机的吗？───┐
                   ▼  │                              │
-                  ──┤            是                  │
+                  ── ┤            是                 │
                      │             ▼                 │
                      │        [ INPUT ]              │
                      │             │                 │
                      │             ▼                 │
-                     │      本机进程处理               │
-                     │                                │
-                     │    否（要转发出去/本机产生的）    │
+                     │      本机进程处理                │
+                     │                               │
+                     │    否（要转发出去/本机产生的）      │
                      │             ▼                 │
                      │       [ FORWARD ]    ← 转发的走这里
                      │             │                 │
                      ▼             │                 │
-                  本机产生         │                 │
-                  的包             │                 │
+                  本机产生         │                   │
+                  的包             │                  │
                   [ OUTPUT ]       │                 │
                      │             │                 │
                      ▼             ▼                 │
@@ -393,19 +387,17 @@ MASQUERADE 在 POSTROUTING 这个时机改源 IP——也就是包要离开宿�
 第 1 步：包在容器 netns 里产生
 
 src=10.22.0.2  dst=8.8.8.8
-容器路由表说默认走 eth0（容器内的 eth0 = veth 的容器端）。
+容器路由表说默认走 eth0（容器内的 eth0, 也就是 veth 的容器端）。
 
-第 2 步：veth 把包送到宿主机端 veth 是双向管道，包瞬间从宿主机的 vethXXX 出来。
+第 2 步：veth 把包送到宿主机端, veth 是双向管道，包瞬间从宿主机的 vethXXX 出来。
 
-第 3 步：进入 bridge mydocker0 所有 vethXXX 都接在 mydocker0 上，bridge 收到这个包。bridge 看 dst MAC，发现不是同 bridge 内任何一个容器的——也不是 bridge 自己的——把包"上交"给宿主机的 IP 层。
+第 3 步：进入 bridge mydocker0, 所有 vethXXX 都接在 mydocker0 上，bridge 收到这个包。bridge 看 dst MAC，发现不是同 bridge 内任何一个容器的——也不是 bridge 自己的——把包"上交"给宿主机的 IP 层。
 
 第 4 步：宿主机 IP 层路由决策 查宿主机的路由表：
-
 default via 192.168.252.1 dev eth0   ← 默认走真实网卡 eth0
 决定从 eth0 出去。
 
 第 5 步：进入 POSTROUTING 链（关键时刻）
-
 包当前是 src=10.22.0.2 dst=8.8.8.8
 出口网卡是 eth0（不是 mydocker0）
 源地址 10.22.0.2 命中规则 -s 10.22.0.0/16
@@ -414,7 +406,6 @@ MASQUERADE 触发：把源 IP 改成 eth0 的 IP，变成 src=192.168.252.2 dst=
 第 6 步：包从 eth0 发出 运营商看到的源 IP 是 192.168.252.2（公网认得这个），它会把回包送回宿主机。
 
 第 7 步：回包返回
-
 8.8.8.8 → 192.168.252.2
 进入宿主机 PREROUTING 链
 conntrack 看到这个包对应之前那个 NAT 连接，反向改写目标地址：192.168.252.2 → 10.22.0.2
@@ -422,7 +413,6 @@ conntrack 看到这个包对应之前那个 NAT 连接，反向改写目标地�
 容器进程看到回包，全程不知道有 NAT 这回事
 为什么必须做 MASQUERADE
 容器 IP（10.22.0.2）是私有 IP——它只在你这台宿主机内的 mydocker0 网段有意义。把这个 IP 发到公网上，运营商：
-
 根本不认识这个 IP（10.0.0.0/8 是 RFC 1918 私有段）
 即使认识，回包也回不来——它不知道 10.22.0.2 在地球上哪里
 所以必须用宿主机的真实 IP 当包的源——换张身份证出门。MASQUERADE 就是干这个的。
@@ -432,81 +422,64 @@ conntrack 看到这个包对应之前那个 NAT 连接，反向改写目标地�
 MASQUERADE / SNAT	改源 IP	POSTROUTING（出本机前）	容器出网、上公网
 DNAT	改目标 IP	PREROUTING（进本机后）	端口映射（外面 → 容器）
 两个一起组成"双向 NAT"：
-
 进来的：外部:公网IP:8080 → DNAT → 容器:10.22.0.2:80
 出去的：容器:10.22.0.2 → SNAT → 外部:宿主机IP
+
 一句话总结
-概念	一句话定义
-netns	一组独立的网络资源（网卡、路由、iptables）
-网卡	能收发数据的设备，每张属于某个 netns
-veth	一对绑定的虚拟网卡，从一端进数据立刻从另一端出
-bridge	虚拟交换机，让接到它身上的网卡互通
-eth0	约定俗成的第一张以太网卡名字，物理虚拟都能叫
-veth_host	我举例时随便起的名字，指 veth pair 留在宿主机的那头
-MASQUERADE	iptables 在 POSTROUTING 时把出网包的源 IP 改成出口网卡的 IP（容器出网的"换身份证"）
-DNAT	iptables 在 PREROUTING 时把进来包的目标 IP 改成容器 IP（端口映射）
-容器越多，宿主机的 veth 越多，这是正常现象。容器删除时 veth 自动回收，不需要手动清理。
+|概念 | 一句话定义|
+|-------|-------|
+|netns	|一组独立的网络资源（网卡、路由、iptables）|
+|网卡	|能收发数据的设备，每张属于某个 netns|
+|veth	|一对绑定的虚拟网卡，从一端进数据立刻从另一端出|
+|bridge	|虚拟交换机，让接到它身上的网卡互通|
+|eth0	|约定俗成的第一张以太网卡名字，物理虚拟都能叫|
+|veth_host	|我举例时随便起的名字，指 veth pair 留在宿主机的那头|
+|MASQUERADE	|iptables 在 POSTROUTING 时把出网包的源 IP 改成出口网卡的 IP（容器出网的"换身份证"）|
+|DNAT	|iptables 在 PREROUTING 时把进来包的目标 IP 改成容器 IP（端口映射）|
+容器越多，宿主机的 veth 越多，这是正常现象。容器删除时 veth 自动回收，不需要手动清理
 
 
 # 既然 mydocker0 是 Bridge，为什么 iptables 规则里还要写 ! -o mydocker0（不从它出去）？
 这其实是一个“防止误杀”的保护机制。
-
 要想理解这个，我们要先理解 mydocker0 在 Linux 宿主机上的双重身份：
-
 在二层（数据链路层）： 它是一个虚拟交换机。把所有容器的 veth 网卡连在一起。
-
 在三层（网络层）： 对于宿主机来说，它同时也是一张普通的网卡（Network Interface），并且配置了容器网段的网关 IP（比如 10.22.0.1）。
 
 现在，我们假设没有 ! -o mydocker0 这个限制，规则变成只要源 IP 是 10.22.0.x 就做 NAT 转换。我们来看看会发生什么：
-
 场景 A（容器 A 访问外网 8.8.8.8）：
 包的目的地是公网，路由决定走宿主机的物理网卡 eth0 出去。经过 iptables 时，源 IP 被成功替换成宿主机 IP。这是我们期望的。
 
 场景 B（容器 A 访问同宿主机上的 容器 B 10.22.0.3）：
 包的目的地是同一个网段的容器 B。这个包进入了 mydocker0，然后 mydocker0 发现目标在自己身上，于是把包从 mydocker0 发出去，塞给容器 B 的 veth 端口。
-灾难来了： 如果没有限制，这个包也会被源地址转换（SNAT）！容器 B 收到的包，源 IP 会变成宿主机网关的 IP（10.22.0.1），而不是容器 A 的真实 IP（10.22.0.2）。这会导致容器间的内网通信丢失真实的源 IP。
+灾难来了： 如果没有限制，这个包也会被源地址转换（SNAT）！
+容器 B 收到的包，源 IP 会变成宿主机网关的 IP（10.22.0.1），而不是容器 A 的真实 IP（10.22.0.2）。这会导致容器间的内网通信丢失真实的源 IP。
 
 结论：
 ! -o mydocker0 的大白话翻译是：“如果这个包只是在咱们容器小区内部串门（最终还是从 mydocker0 这个交换机发给别的容器），那就保留原样；只有当这个包要离开小区，走别的网卡（比如 eth0）去互联网大街上时，才给它换上宿主机的公网身份证。”
 
 # 包既然已经从宿主机的 vethXXX 出来了，为什么不直接去找宿主机，而是要去找 mydocker0 网桥？
 这个问题非常棒，它涉及到了网卡被“奴役（Enslave）”的概念。
-
 在 Linux 中，一旦你把一张网卡（哪怕是 vethXXX）绑定到了一个网桥（Bridge）上，这张网卡就失去了它的“独立自由”，变成了网桥的一个物理端口。
-
 我们可以用物理机房来打个比方：
-
 容器 = 你的独立服务器。
-
 veth pair = 一根实体的网线。
-
 vethXXX（宿主机端） = 这根网线插在交换机上的那个水晶头/端口。
-
 mydocker0 = 一台实体的二层交换机。
 
 宿主机的 IP 路由协议栈 = 机房对外的大路由器。
-
 当数据包从容器发出时，流程是这样的：
-
 容器把数据包塞进网线（容器内的 eth0）。
-
 信号通过网线瞬间传到了另一头，也就是宿主机上的 vethXXX。
-
 关键点来了： vethXXX 此时已经插在 mydocker0 这台交换机上了（你可以回忆一下，用 ip link 看时，它后面带有 master mydocker0 的字样）。
-
 因此，当数据从 vethXXX 这个水晶头冒出来的时候，它直接喷在了交换机 (mydocker0) 的背板上，而不是喷在宿主机的全局网络里。
 
 那 mydocker0 交换机收到包后会怎么做？
 它会看包的目标 MAC 地址（这是二层行为）：
-
 如果目标 MAC 是另一个容器，交换机直接把包丢进另一个插在它身上的 vethYYY 端口里。（全程不打扰宿主机的大路由器）。
-
 如果容器是要上网，它填写的 MAC 地址是默认网关的 MAC 地址（也就是 mydocker0 自己在宿主机上那张网卡的 MAC）。这时候，mydocker0 才会把包“向上”提交给宿主机的 IP 路由协议栈，让宿主机去查路由表，最终转交给 eth0。
 
 结论：
 不是包不想直接去找宿主机，而是 vethXXX 已经被编入了 mydocker0 的编制，变成了它的一个接口。从这个接口出来的数据，第一接手人必然是 mydocker0 自身的二层转发逻辑。
-
-
 
 # 在 run.go里跟网络有关的就这几件事：
 解析 flag（--network、-p）
@@ -514,7 +487,6 @@ mydocker0 = 一台实体的二层交换机。
 创建 CNI manager 客户端，注册回调 networkSetup
 注册 iptables DNAT 规则（端口映射）
 run.go 自己不直接做 veth、bridge、iptables——这些活全交给：
-
 CNI 插件二进制（/opt/cni/bin/bridge、/opt/cni/bin/host-local、/opt/cni/bin/portmap）做底层 ip link / route / iptables 操作
 pkg/network 包做 CNI 调用封装 + 部分自己写的 iptables 规则
 让我把整条链路画出来。
