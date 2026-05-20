@@ -43,18 +43,25 @@ type runOptions struct {
 func newRunCmd() *cobra.Command {
 	var o runOptions
 	cmd := &cobra.Command{
-		Use:   "run [flags] -- <cmd> [args...]",
+		Use:   "run [flags] [--] <image|--rootfs PATH> [cmd...]",
 		Short: "Run a command in a new container",
 		Long: `Start a new container running the given command.
 
-Use --image to run from an imported image (overlayfs), or --rootfs to run
-against an existing directory.`,
-		Example: `  mydocker run -it --image busybox -- /bin/sh
+Use --image to specify the image, or --rootfs for a pre-built directory.
+Docker-style shorthand is also accepted: the first positional arg is treated
+as the image when --image / --rootfs is not given.`,
+		Example: `  mydocker run -it busybox sh                            # docker-style
+  mydocker run -it --image busybox -- /bin/sh
   mydocker run -d --image nginx --name web --memory 200m --cpus 0.5 -- nginx -g "daemon off;"
   mydocker run -it --rootfs /tmp/alpine -- /bin/sh`,
-		// 允许 0 个位置参数（使用镜像默认 CMD）或任意多个（覆盖 CMD）
+		// 允许任意位置参数：第一个可作为 image，其余作为 cmd
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// docker-style: 没有显式 --image / --rootfs 时，把第一个位置参数当 image
+			if o.image == "" && o.rootfs == "" && len(args) > 0 {
+				o.image = args[0]
+				args = args[1:]
+			}
 			return runContainer(o, args)
 		},
 	}
@@ -140,23 +147,31 @@ func runContainer(o runOptions, cmdArgs []string) error {
 		return err
 	}
 
-	// 如果后续任何一步失败，回滚占位记录。
+	containerDir := st.ContainerDir(id)
+	logPath := filepath.Join(containerDir, "container.log")
+
+	// 如果后续任何一步失败，回滚占位记录 + 已挂载的 overlay。
 	// 成功路径下 success=true，defer 就变成 no-op。
 	success := false
+	usingOverlay := false
 	defer func() {
-		if !success {
-			_ = st.Remove(id)
+		if success {
+			return
 		}
+		// 顺序：先 umount overlay（如果挂了），再删 store 记录
+		// （否则 store.Remove 里的 RemoveAll 会因为 merged 是 mount point 而失败，
+		// 留下孤儿记录）。
+		if usingOverlay {
+			_ = image.CleanupRootfs(containerDir)
+		}
+		_ = st.Remove(id)
 	}()
 
-	containerDir := st.ContainerDir(id)
 	if err := os.MkdirAll(containerDir, 0755); err != nil {
 		return err
 	}
-	logPath := filepath.Join(containerDir, "container.log")
 
 	var mergedRoot string
-	var usingOverlay bool
 	var imageConfig image.ImageConfig
 	if o.image != "" {
 		is, err := image.New(store.Root())
@@ -180,17 +195,13 @@ func runContainer(o runOptions, cmdArgs []string) error {
 
 	if len(mounts) > 0 {
 		if err := rootfs.ApplyBindMounts(mergedRoot, mounts); err != nil {
-			if usingOverlay {
-				_ = image.CleanupRootfs(containerDir)
-			}
 			return fmt.Errorf("apply bind mounts: %w", err)
 		}
 	}
 
 	rollback := func() {
-		if usingOverlay {
-			_ = image.CleanupRootfs(containerDir)
-		}
+		// kept for legacy callers below; the deferred cleanup now handles
+		// overlay/store cleanup uniformly via success=false.
 	}
 
 	// Network mode: bridge / host / none.
@@ -355,6 +366,23 @@ func runContainer(o runOptions, cmdArgs []string) error {
 		return werr
 	}
 	if code != 0 {
+		// 容器非 0 退出。如果容器活了不到 100ms 就死，多半是 init 子进程
+		// 在 fork 之后、execve 之前就被某种 LSM/seccomp/namespace 限制拒绝了，
+		// 用户日志里看不到任何东西。给个明显的提示。
+		lifetime := rec.FinishedAt.Sub(rec.CreatedAt)
+		if lifetime < 100*time.Millisecond {
+			fmt.Fprintf(os.Stderr,
+				"\nerror: container %s exited with code %d after only %v.\n"+
+					"This usually means the init process was killed before exec()\n"+
+					"by AppArmor / seccomp / nested-userns restrictions, or the host\n"+
+					"already has conflicting bridge/veth devices.\n"+
+					"Try:\n"+
+					"  1. sudo mydocker run --network host ...   (skip CNI)\n"+
+					"  2. sudo dmesg | tail -20                  (look for 'DENIED' / 'apparmor')\n"+
+					"  3. clean stale state: sudo rm -rf /var/lib/mydocker/containers/* /var/lib/cni/networks/*\n"+
+					"  4. on lima/multipass: ensure no docker/containerd/buildkit is running\n",
+				rec.ID, code, lifetime)
+		}
 		os.Exit(code)
 	}
 	return nil

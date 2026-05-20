@@ -5,6 +5,7 @@ package sandbox
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -183,11 +184,20 @@ func (m *Manager) stop(id string) error {
 
 // pidAlive 是 sandbox 包内的私有实现（package-level），
 // 不依赖 cmd/mydocker 中同名函数。
+//
+// 用 kill(pid, 0) 探活：
+//   - nil   → 进程存在
+//   - EPERM → 进程存在但当前调用方无权限（视为存活）
+//   - ESRCH → 不存在
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, syscall.EPERM)
 }
 
 // newSandboxID 生成 12 位十六进制。

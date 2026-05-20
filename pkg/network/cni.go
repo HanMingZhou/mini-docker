@@ -23,6 +23,20 @@ import (
 	current "github.com/containernetworking/cni/pkg/types/100"
 )
 
+// debugEnabled 受环境变量 MYDOCKER_DEBUG 控制：非空 / "1" / "true" 时打印 debug 日志。
+// 这样默认情况下 CLI 不会用日志噪声污染用户终端（和 docker 行为一致）。
+var debugEnabled = func() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("MYDOCKER_DEBUG")))
+	return v != "" && v != "0" && v != "false" && v != "no"
+}()
+
+// debugf prints to stderr only when MYDOCKER_DEBUG is set.
+func debugf(format string, args ...any) {
+	if debugEnabled {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
+}
+
 // DefaultConfDir 是 CNI 配置目录的默认位置。
 const DefaultConfDir = "/etc/cni/net.d"
 
@@ -111,7 +125,7 @@ func (m *Manager) loadDefaultNetwork() error {
 			continue
 		}
 		m.netList = list
-		fmt.Fprintf(os.Stderr, "cni: loaded network %q from %s\n", list.Name, p)
+		debugf("cni: loaded network %q from %s\n", list.Name, p)
 		return nil
 	}
 	return fmt.Errorf("no valid cni config in %s", m.confDir)

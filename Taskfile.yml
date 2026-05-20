@@ -1,0 +1,306 @@
+# mini-docker Taskfile
+# 安装 task: brew install go-task   (https://taskfile.dev)
+# 列出所有任务: task --list
+
+version: '3'
+
+vars:
+  BIN_DIR: bin
+  GOFLAGS: -trimpath
+  LDFLAGS: -s -w
+  MYDOCKER: '{{.BIN_DIR}}/mydocker'
+  MYDOCKER_CRI: '{{.BIN_DIR}}/mydocker-cri'
+
+tasks:
+  default:
+    desc: 列出全部可用任务
+    cmds:
+      - task --list
+    silent: true
+
+  # ---------------- build ----------------
+
+  build:
+    desc: 本机构建（产物只能在本机 OS/ARCH 上运行）
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - |
+        if [ "$(go env GOOS)" != "linux" ]; then
+          printf '\033[33m>> WARN: mini-docker 运行时依赖 Linux 内核（namespaces / cgroups / overlayfs）。\n'
+          printf '         在 %s 上构建出来的二进制可以跑 pull / images / rmi 等纯逻辑命令，\n' "$(go env GOOS)"
+          printf '         但 run / exec / CRI server 等核心功能会直接报错。\n'
+          printf '         真正运行请改用 task build:linux 把产物跑在 Linux VM / 容器里。\033[0m\n'
+        fi
+      - go build {{.GOFLAGS}} -ldflags "{{.LDFLAGS}}" -o {{.MYDOCKER}}     ./cmd/mydocker
+      - go build {{.GOFLAGS}} -ldflags "{{.LDFLAGS}}" -o {{.MYDOCKER_CRI}} ./cmd/mydocker-cri
+
+  build:linux:
+    desc: 交叉编译到 linux/amd64
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: '0'
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - go build {{.GOFLAGS}} -ldflags "{{.LDFLAGS}}" -o {{.MYDOCKER}}     ./cmd/mydocker
+      - go build {{.GOFLAGS}} -ldflags "{{.LDFLAGS}}" -o {{.MYDOCKER_CRI}} ./cmd/mydocker-cri
+
+  build:linux-arm64:
+    desc: 交叉编译到 linux/arm64
+    env:
+      GOOS: linux
+      GOARCH: arm64
+      CGO_ENABLED: '0'
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - go build {{.GOFLAGS}} -ldflags "{{.LDFLAGS}}" -o {{.MYDOCKER}}     ./cmd/mydocker
+      - go build {{.GOFLAGS}} -ldflags "{{.LDFLAGS}}" -o {{.MYDOCKER_CRI}} ./cmd/mydocker-cri
+
+  # ---------------- code quality ----------------
+
+  tidy:
+    desc: go mod tidy
+    cmds: [go mod tidy]
+
+  vet:
+    desc: go vet ./...
+    cmds: [go vet ./...]
+
+  test:
+    desc: 跑全部单元测试
+    cmds: [go test ./...]
+
+  # ---------------- e2e / smoke (Linux only) ----------------
+
+  smoke:l1:
+    desc: L1 最小冒烟（namespace + cgroup + rootfs）
+    preconditions:
+      - sh: '[ "$(go env GOOS)" = "linux" ]'
+        msg: smoke:l1 仅可在 Linux 上运行
+    cmds:
+      - sudo ROOTFS=./rootfs-busybox ./scripts/smoke-l1.sh
+
+  e2e:docker:
+    desc: L2 完整 Docker 功能 e2e（22 项）
+    preconditions:
+      - sh: '[ "$(go env GOOS)" = "linux" ]'
+        msg: e2e:docker 仅可在 Linux 上运行
+    cmds:
+      - sudo bash scripts/e2e-docker.sh
+
+  smoke:l3:
+    desc: L3 CRI 冒烟（sandbox / image / container / exec）
+    preconditions:
+      - sh: '[ "$(go env GOOS)" = "linux" ]'
+        msg: smoke:l3 仅可在 Linux 上运行
+    cmds:
+      - sudo bash scripts/smoke-l3.sh
+
+  e2e:kubeadm:
+    desc: L4B kubeadm init 端到端
+    preconditions:
+      - sh: '[ "$(go env GOOS)" = "linux" ]'
+        msg: e2e:kubeadm 仅可在 Linux 上运行
+    cmds:
+      - sudo bash scripts/kubeadm-e2e.sh
+
+  # ---------------- macOS dev VM (lima + vmnet shared) ----------------
+
+  vm:doctor:
+    desc: 检查 macOS 上的 lima/socket_vmnet 环境（不会改变状态）
+    cmds:
+      - |
+        ok=0; warn=0
+        echo "== checking lima =="
+        if command -v limactl >/dev/null 2>&1; then
+          echo "  ✓ limactl: $(limactl --version 2>&1 | head -1)"
+        else
+          echo "  ✗ limactl not found. Install with: brew install lima"; warn=$((warn+1))
+        fi
+        echo
+        echo "== checking socket_vmnet =="
+        if [ -x /opt/socket_vmnet/bin/socket_vmnet ]; then
+          echo "  ✓ /opt/socket_vmnet/bin/socket_vmnet present"
+        elif [ -x /usr/local/opt/socket_vmnet/bin/socket_vmnet ]; then
+          echo "  ! socket_vmnet only at /usr/local/opt/... — lima expects /opt/socket_vmnet/..."
+          echo "    run: task vm:setup-vmnet  (one-time, requires sudo)"
+          warn=$((warn+1))
+        else
+          echo "  ✗ socket_vmnet missing. run: task vm:setup-vmnet"
+          warn=$((warn+1))
+        fi
+        echo
+        echo "== checking sudoers =="
+        if sudo -n test -r /etc/sudoers.d/lima 2>/dev/null; then
+          echo "  ✓ /etc/sudoers.d/lima present"
+        else
+          echo "  ! /etc/sudoers.d/lima missing or unreadable"
+          echo "    run: task vm:setup-vmnet  (regenerates sudoers)"
+          warn=$((warn+1))
+        fi
+        echo
+        if [ $warn -eq 0 ]; then
+          echo "everything looks good. next: task vm:fresh"
+        else
+          echo "found $warn issue(s). fix first, then task vm:fresh"
+        fi
+
+  vm:setup-vmnet:
+    desc: 一次性安装 socket_vmnet 到 /opt 并生成 lima sudoers（需要 sudo）
+    cmds:
+      - |
+        if [ "$(uname)" != "Darwin" ]; then
+          echo ">> not macOS, skipping" >&2; exit 0
+        fi
+      - |
+        if ! command -v limactl >/dev/null 2>&1; then
+          echo ">> limactl not installed. brew install lima first." >&2; exit 1
+        fi
+      - |
+        if ! brew list socket_vmnet >/dev/null 2>&1; then
+          echo "==> brew install socket_vmnet"
+          brew install socket_vmnet
+        fi
+      - |
+        # locate brew-installed binary
+        SRC=""
+        for p in /usr/local/opt/socket_vmnet /opt/homebrew/opt/socket_vmnet; do
+          if [ -x "$p/bin/socket_vmnet" ]; then SRC="$p"; break; fi
+        done
+        if [ -z "$SRC" ]; then
+          echo ">> socket_vmnet binary not found after brew install" >&2; exit 1
+        fi
+        echo "==> copying $SRC/bin/socket_vmnet -> /opt/socket_vmnet/bin/"
+        sudo mkdir -p /opt/socket_vmnet/bin
+        sudo cp "$SRC/bin/socket_vmnet"        /opt/socket_vmnet/bin/
+        sudo cp "$SRC/bin/socket_vmnet_client" /opt/socket_vmnet/bin/
+        sudo chown -R root:wheel /opt/socket_vmnet
+        sudo chmod -R go-w       /opt/socket_vmnet
+      - |
+        echo "==> generating /etc/sudoers.d/lima"
+        limactl sudoers | sudo tee /etc/sudoers.d/lima >/dev/null
+        sudo chmod 0440 /etc/sudoers.d/lima
+        echo "==> done. next: task vm:fresh"
+
+  vm:fresh:
+    desc: 销毁并重建 lima VM mydocker（ubuntu-lts + vmnet shared，VM IP 192.168.105.x）
+    vars:
+      VM_NAME: '{{.VM_NAME | default "mydocker"}}'
+      VM_CPUS: '{{.VM_CPUS | default "4"}}'
+      VM_MEM:  '{{.VM_MEM  | default "4"}}'
+      VM_DISK: '{{.VM_DISK | default "20"}}'
+    cmds:
+      - |
+        if ! command -v limactl >/dev/null 2>&1; then
+          echo ">> lima not installed. brew install lima first." >&2; exit 1
+        fi
+      - limactl stop -f {{.VM_NAME}} 2>/dev/null || true
+      - limactl delete {{.VM_NAME}}  2>/dev/null || true
+      - limactl start --name={{.VM_NAME}} --cpus={{.VM_CPUS}} --memory={{.VM_MEM}} --disk={{.VM_DISK}} --tty=false template://ubuntu-lts
+      - |
+        # add vmnet shared so the host can reach the VM at 192.168.105.x
+        if ! grep -q '^networks:' "$HOME/.lima/{{.VM_NAME}}/lima.yaml"; then
+          printf '\nnetworks:\n- lima: shared\n' >> "$HOME/.lima/{{.VM_NAME}}/lima.yaml"
+          echo "==> added vmnet shared, restarting VM"
+          limactl stop {{.VM_NAME}}
+          limactl start {{.VM_NAME}}
+        fi
+      - |
+        echo
+        echo "== VM ready =="
+        limactl shell {{.VM_NAME}} -- ip -4 addr show lima0 2>/dev/null | awk '/inet / {print "  vmnet IP: "$2}'
+        echo "  enter shell:        task vm:shell"
+        echo "  install mydocker:   task vm:install-mydocker"
+
+  vm:shell:
+    desc: 进入 lima VM
+    vars: { VM_NAME: '{{.VM_NAME | default "mydocker"}}' }
+    cmds:
+      - "limactl shell {{.VM_NAME}}"
+
+  vm:install-mydocker:
+    desc: 在 VM 内构建并安装 mydocker + CNI（首次或代码改动后跑）
+    vars: { VM_NAME: '{{.VM_NAME | default "mydocker"}}' }
+    cmds:
+      - |
+        limactl shell {{.VM_NAME}} -- bash -c '
+          set -e
+          # 1. ensure go + task
+          if ! command -v go   >/dev/null 2>&1; then sudo snap install go   --classic; fi
+          if ! command -v task >/dev/null 2>&1; then sudo snap install task --classic; fi
+          sudo ln -sf /snap/bin/go   /usr/local/bin/go   2>/dev/null || true
+          sudo ln -sf /snap/bin/task /usr/local/bin/task 2>/dev/null || true
+          # 2. sync source to VM-local writable copy
+          rsync -a --delete --exclude bin/ --exclude .git/ /Users/'"$(whoami)"'/go/src/mini-docker/ ~/mini-docker/ 2>/dev/null \
+            || rsync -a --delete --exclude bin/ --exclude .git/ '"{{.ROOT_DIR}}"'/ ~/mini-docker/
+          cd ~/mini-docker
+          rm -rf bin/
+          task build
+          sudo install -m 0755 bin/mydocker     /usr/local/bin/mydocker
+          sudo install -m 0755 bin/mydocker-cri /usr/local/bin/mydocker-cri
+          if [ ! -x /opt/cni/bin/bridge ]; then sudo bash scripts/install-cni.sh; fi
+          sudo modprobe overlay      2>/dev/null || true
+          sudo modprobe br_netfilter 2>/dev/null || true
+          echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
+          echo 1 | sudo tee /proc/sys/net/bridge/bridge-nf-call-iptables >/dev/null 2>/dev/null || true
+          which mydocker mydocker-cri
+        '
+
+  vm:reset-net:
+    desc: 清掉 VM 里的 CNI/iptables/容器残留（VM 重启后或网络异常时跑）
+    vars: { VM_NAME: '{{.VM_NAME | default "mydocker"}}' }
+    cmds:
+      - |
+        limactl shell {{.VM_NAME}} -- bash -c '
+          set +e
+          echo "==> stopping all mydocker containers"
+          sudo /usr/local/bin/mydocker ps -a 2>/dev/null | tail -n +2 | awk "{print \$1}" | while read id; do
+            [ -n "$id" ] && sudo /usr/local/bin/mydocker rm -f "$id" >/dev/null 2>&1
+          done
+          sudo umount /var/lib/mydocker/containers/*/merged 2>/dev/null
+          sudo rm -rf /var/lib/mydocker/containers/*
+          echo "==> flushing iptables nat table"
+          sudo iptables -t nat -F
+          sudo iptables -t nat -X
+          echo "==> flushing CNI custom chains in filter"
+          sudo iptables -t filter -F CNI-FORWARD 2>/dev/null
+          sudo iptables -t filter -F CNI-ADMIN   2>/dev/null
+          echo "==> clearing CNI IPAM + cache"
+          sudo rm -rf /var/lib/cni/networks/* /var/lib/cni/cache/*
+          echo "==> reloading kernel modules + sysctls"
+          sudo modprobe overlay      2>/dev/null || true
+          sudo modprobe br_netfilter 2>/dev/null || true
+          echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
+          echo 1 | sudo tee /proc/sys/net/bridge/bridge-nf-call-iptables >/dev/null 2>/dev/null || true
+          echo "==> deleting stale bridge"
+          sudo ip link del mydocker0 2>/dev/null
+          for v in $(ip -o link | awk -F": " "/veth/ {print \$2}" | cut -d@ -f1); do
+            sudo ip link del "$v" 2>/dev/null
+          done
+          echo "==> done. you can now: sudo mydocker run -d --image nginx -p 8080:80 nginx"
+        '
+
+  vm:status:
+    desc: 查看 lima VM 状态
+    vars: { VM_NAME: '{{.VM_NAME | default "mydocker"}}' }
+    cmds:
+      - "limactl info {{.VM_NAME}}"
+
+  vm:stop:
+    desc: 停掉 lima VM（保留磁盘）
+    vars: { VM_NAME: '{{.VM_NAME | default "mydocker"}}' }
+    cmds:
+      - "limactl stop {{.VM_NAME}}"
+
+  vm:destroy:
+    desc: 彻底销毁 lima VM（不可逆）
+    vars: { VM_NAME: '{{.VM_NAME | default "mydocker"}}' }
+    cmds:
+      - "limactl delete {{.VM_NAME}}"
+
+  # ---------------- housekeeping ----------------
+
+  clean:
+    desc: 删除构建产物
+    cmds:
+      - rm -rf {{.BIN_DIR}}
