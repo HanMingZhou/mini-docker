@@ -59,11 +59,13 @@ check 'mydocker ps | grep -q "7777->80/tcp"' "port shown in ps"
 log "port mapping works (curl)"
 sleep 1  # extra wait for httpd to bind
 # Try direct container IP first (always works), then DNAT
+# Use --noproxy '*' so an HTTP proxy in the user's env (lima default keeps
+# http_proxy pointed at the host) doesn't intercept localhost / RFC1918 traffic.
 WEB_IP=$(mydocker inspect web-e2e 2>/dev/null | grep network_ip | tr -d '" ,' | awk -F: '{print $2}')
-CURL_OUT=$(curl -s --max-time 5 "http://${WEB_IP}:80/" 2>&1)
+CURL_OUT=$(curl -s --noproxy '*' --max-time 5 "http://${WEB_IP}:80/" 2>&1)
 if [[ "$CURL_OUT" != *"e2e-ok"* ]]; then
     # Fallback: try DNAT
-    CURL_OUT=$(curl -s --max-time 5 http://127.0.0.1:7777/ 2>&1)
+    CURL_OUT=$(curl -s --noproxy '*' --max-time 5 http://127.0.0.1:7777/ 2>&1)
 fi
 check '[[ "$CURL_OUT" == *"e2e-ok"* ]]' "curl container returns e2e-ok"
 

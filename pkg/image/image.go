@@ -7,12 +7,12 @@
 //
 // 容器 rootfs 用 OverlayFS 组装：
 //
-//	lowerdir = layers/0:layers/1:...  （从下往上，layer 0 在最底）
+//	lowerdir = layers/0:layers/1:...  （从下往上,layer 0 在最底）
 //	upperdir = <container>/upper
 //	workdir  = <container>/work
 //	merged   = <container>/merged     ← 容器内的 /
 //
-// Level 3 再对接 OCI registry / manifest，这里保持极简。
+// Level 3 再对接 OCI registry / manifest,这里保持极简。
 package image
 
 import (
@@ -30,12 +30,12 @@ type Manifest struct {
 	Name      string    `json:"name"`
 	Reference string    `json:"reference,omitempty"`  // 完整引用（如 index.docker.io/library/nginx:latest）
 	Digest    string    `json:"digest,omitempty"`     // image config digest（sha256:...）
-	Layers    []string  `json:"layers"`               // 相对 images/<name>/ 的路径，顺序：下到上
-	LayerRefs []string  `json:"layer_refs,omitempty"` // 共享层目录路径（相对 <root>/layers/），与 Layers 一一对应
+	Layers    []string  `json:"layers"`               // 相对 images/<name>/ 的路径,顺序：下到上
+	LayerRefs []string  `json:"layer_refs,omitempty"` // 共享层目录路径（相对 <root>/layers/）,与 Layers 一一对应
 	Size      int64     `json:"size,omitempty"`       // 镜像总大小（字节）
 	CreatedAt time.Time `json:"created_at"`
 
-	// --- image config（默认值，run 时可被覆盖）---
+	// --- image config（默认值,run 时可被覆盖）---
 	Config ImageConfig `json:"config,omitempty"`
 }
 
@@ -50,10 +50,10 @@ type ImageConfig struct {
 
 // Store 管理本地镜像。
 type Store struct {
-	root string // 数据根目录，镜像放在 <root>/images/
+	root string // 数据根目录,镜像放在 <root>/images/
 }
 
-// New 返回一个镜像 Store，目录不存在会自动创建。
+// New 返回一个镜像 Store,目录不存在会自动创建。
 func New(root string) (*Store, error) {
 	if root == "" {
 		return nil, errors.New("image store root is empty")
@@ -68,7 +68,7 @@ func New(root string) (*Store, error) {
 // Root 返回 Store 的根目录。
 func (s *Store) Root() string { return s.root }
 
-// LayersDir 返回共享层目录 <root>/layers/，按 digest 寻址。
+// LayersDir 返回共享层目录 <root>/layers/,按 digest 寻址。
 func (s *Store) LayersDir() string { return filepath.Join(s.root, "layers") }
 
 // ImageDir 返回镜像根目录（可能尚未创建）。
@@ -131,7 +131,7 @@ func (s *Store) LoadManifest(name string) (*Manifest, error) {
 //   - 短名（manifest.Name）                         : "nginx:alpine"
 //   - 完整 registry 引用（manifest.Reference）      : "index.docker.io/library/nginx:alpine"
 //   - digest（manifest.Digest 或 sha256:<hex>）     : "sha256:abc..."
-//   - 无 tag 的短名，自动补 ":latest"               : "nginx"
+//   - 无 tag 的短名,自动补 ":latest"               : "nginx"
 //
 // 未找到返回 nil, nil（不是错误）。
 func (s *Store) Resolve(ref string) (*Manifest, error) {
@@ -215,8 +215,8 @@ func (s *Store) SaveManifest(m *Manifest) error {
 	return os.Rename(tmp, target)
 }
 
-// Remove 删除一个镜像（只在没有容器引用它时才安全，调用方自行检查）。
-// 对于拉取的镜像（使用 LayerRefs），会尝试 GC 没有被其它镜像引用的共享层。
+// Remove 删除一个镜像（只在没有容器引用它时才安全,调用方自行检查）。
+// 对于拉取的镜像（使用 LayerRefs）,会尝试 GC 没有被其它镜像引用的共享层。
 func (s *Store) Remove(name string) error {
 	if !s.Exists(name) {
 		return fmt.Errorf("no such image: %s", name)
@@ -231,7 +231,7 @@ func (s *Store) Remove(name string) error {
 	return nil
 }
 
-// gcOrphanLayers 扫描 <root>/layers/ 下所有层，删除没有任何镜像引用的。
+// gcOrphanLayers 扫描 <root>/layers/ 下所有层,删除没有任何镜像引用的, "全局 GC"
 // 失败不视为致命错误（只打 warn）。
 func (s *Store) gcOrphanLayers() {
 	// 收集所有镜像引用的层
@@ -241,13 +241,14 @@ func (s *Store) gcOrphanLayers() {
 		for _, lr := range m.LayerRefs {
 			// LayerRefs 形如 "layers/<key>"
 			key := filepath.Base(lr)
-			refs[key] = true
+			refs[key] = true //  标记 "sha256_xxx" 仍在被引用
 		}
 	}
 	entries, err := os.ReadDir(s.LayersDir())
 	if err != nil {
 		return
 	}
+	// 没出现在 refs 里的，全删
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -259,7 +260,7 @@ func (s *Store) gcOrphanLayers() {
 }
 
 // Import 从 tar/tar.gz 归档导入一个镜像。
-// 导入后镜像只有一层（layer 0），和 `docker export` 导出的 rootfs 行为一致。
+// 导入后镜像只有一层（layer 0）,和 `docker export` 导出的 rootfs 行为一致。
 // Level 3 的 PullImage 实现会调另一条路径（多层 + whiteout 处理）。
 func (s *Store) Import(name, tarPath string) error {
 	if name == "" {
@@ -273,7 +274,7 @@ func (s *Store) Import(name, tarPath string) error {
 	}
 
 	imgDir := s.ImageDir(name)
-	layerDir := filepath.Join(imgDir, "layers", "0")
+	layerDir := filepath.Join(imgDir, "layers", "0") // ← images/<name>/layers/0
 	if err := os.MkdirAll(layerDir, 0755); err != nil {
 		return err
 	}
@@ -296,7 +297,7 @@ func (s *Store) Import(name, tarPath string) error {
 	return nil
 }
 
-// LayerPaths 返回镜像所有 layer 的绝对路径，从下到上。
+// LayerPaths 返回镜像所有 layer 的绝对路径,从下到上。
 // 支持任意引用形式。
 func (s *Store) LayerPaths(ref string) ([]string, error) {
 	m, err := s.loadManifest(ref)
@@ -317,13 +318,13 @@ func (s *Store) LayerPaths(ref string) ([]string, error) {
 	if len(m.LayerRefs) > 0 {
 		out := make([]string, 0, len(m.LayerRefs))
 		for _, rel := range m.LayerRefs {
-			out = append(out, filepath.Join(s.root, rel))
+			out = append(out, filepath.Join(s.root, rel)) //  注意是 s.root
 		}
 		return out, nil
 	}
 	out := make([]string, 0, len(m.Layers))
 	for _, rel := range m.Layers {
-		out = append(out, filepath.Join(s.ImageDir(m.Name), rel))
+		out = append(out, filepath.Join(s.ImageDir(m.Name), rel)) // 注意是 s.ImageDir(name)
 	}
 	return out, nil
 }
@@ -339,13 +340,13 @@ type RootfsPaths struct {
 // containerDir 约定为 <root>/containers/<id>。
 func ContainerRootfsPaths(containerDir string) RootfsPaths {
 	return RootfsPaths{
-		Upper:  filepath.Join(containerDir, "upper"),  // 容器独占可写层（空的，启动后容器写东西会填进来）
+		Upper:  filepath.Join(containerDir, "upper"),  // 容器独占可写层（空的,启动后容器写东西会填进来）
 		Work:   filepath.Join(containerDir, "work"),   // overlay 内部工作目录（别碰）
 		Merged: filepath.Join(containerDir, "merged"), // 最终给容器用的 / 根目录（挂载点）
 	}
 }
 
-// PrepareRootfs 为一个容器挂好 overlayfs，返回 merged 目录路径。
+// PrepareRootfs 为一个容器挂好 overlayfs,返回 merged 目录路径。
 // 失败时会自行清理已创建的目录和挂载。
 func (s *Store) PrepareRootfs(imageName, containerDir string) (string, error) {
 	return prepareRootfs(s, imageName, containerDir)
@@ -358,7 +359,7 @@ func CleanupRootfs(containerDir string) error {
 }
 
 // formatLowerDirs 把 layers 拼成 overlay mount 需要的 lowerdir 字符串。
-// overlayfs 的 lowerdir 顺序是 **顶层在前**，即 layers 数组倒过来。
+// overlayfs 的 lowerdir 顺序是 **顶层在前**,即 layers 数组倒过来。
 func formatLowerDirs(layers []string) string {
 	rev := make([]string, len(layers))
 	for i, l := range layers {

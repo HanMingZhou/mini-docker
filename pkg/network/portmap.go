@@ -14,6 +14,7 @@ package network
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -65,7 +66,19 @@ func parseOnePort(s string) (PortMapping, error) {
 // AddPortMappings 为容器添加 iptables DNAT 规则。
 // containerIP 是 CNI 分配的 IPv4（如 "10.33.0.5"）。
 // comment 用于标记规则，方便后续精确删除（通常用容器 ID）。
+//
+// 注意：从宿主机用 127.0.0.1:hostPort 访问需要内核允许把 lo 收到的包
+// 路由到非-lo 接口（DNAT 改写后的目的就在 mydocker0 上）。Linux 默认禁止，
+// 由 net.ipv4.conf.all.route_localnet sysctl 控制。这里统一打开。
+// Docker 也是这么做的。
 func AddPortMappings(containerIP, comment string, mappings []PortMapping) error {
+	if len(mappings) == 0 {
+		return nil
+	}
+	if err := enableRouteLocalnet(); err != nil {
+		// 不致命：外部访问仍可工作；只是宿主机用 127.0.0.1 访问会失败。
+		fmt.Fprintf(os.Stderr, "warn: enable route_localnet: %v\n", err)
+	}
 	for _, pm := range mappings {
 		proto := pm.Protocol
 		if proto == "" {
@@ -128,4 +141,20 @@ func iptables(args ...string) error {
 		return fmt.Errorf("iptables %s: %s", strings.Join(args, " "), strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// enableRouteLocalnet turns on net.ipv4.conf.all.route_localnet so the kernel
+// accepts DNAT from 127.0.0.1/8 to a non-loopback interface. This is required
+// for `curl http://127.0.0.1:HOSTPORT` on the host to reach a container behind
+// a bridge — Docker enables the same sysctl when it sets up port forwarding.
+func enableRouteLocalnet() error {
+	const path = "/proc/sys/net/ipv4/conf/all/route_localnet"
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if strings.TrimSpace(string(cur)) == "1" {
+		return nil
+	}
+	return os.WriteFile(path, []byte("1"), 0644)
 }

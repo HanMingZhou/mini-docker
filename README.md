@@ -52,20 +52,77 @@ mini-docker/
 ## 开发环境
 
 - 代码可在 Windows / macOS / Linux 编辑
-- **运行必须在 Linux**（推荐 Ubuntu 22.04+，cgroups v2 + systemd）
+- **运行必须在 Linux**（推荐 Ubuntu 22.04+，cgroups v2 + systemd）。
+  Mac/Windows 上构建出的二进制只能跑 `pull` / `images` / `rmi` 这种纯逻辑命令；
+  `run` / `exec` / CRI server 一动就报错（namespaces / cgroups / overlayfs 是 Linux 独占）
 - Go 1.21+（当前项目使用 1.24）
-- 推荐 macOS 用户用 multipass 起 VM：
+- 构建工具：[Task](https://taskfile.dev)（已替代 Makefile）
   ```bash
-  multipass launch --cpus 4 --memory 4G --disk 20G --name mydocker-dev 22.04
-  multipass shell mydocker-dev
+  brew install go-task         # macOS
+  # 或: go install github.com/go-task/task/v3/cmd/task@latest
   ```
+
+### macOS 开发环境（lima + vmnet）
+
+macOS 用户推荐用 [lima](https://lima-vm.io) 起 Linux VM。Taskfile 内置了一组
+`vm:*` 任务可以一键搭好——只需要装好 `lima`：
+
+```bash
+brew install lima           # 一次性
+```
+
+然后：
+
+```bash
+task vm:doctor              # 体检：检查 lima / socket_vmnet / sudoers 状态
+task vm:setup-vmnet         # 一次性：装 socket_vmnet 到 /opt + 写 sudoers（需要密码）
+task vm:fresh               # 创建 ubuntu-lts VM 并启用 vmnet shared
+task vm:install-mydocker    # VM 内构建 + install mydocker + 装 CNI 插件
+task vm:shell               # 进入 VM
+task vm:reset-net           # VM 重启后清干净 iptables / CNI / 容器残留
+```
+
+**为什么要 vmnet？** lima 默认是 user-mode 网络，VM 拿到的 `192.168.5.x` 在 Mac 上不可达，
+要访问 VM 的容器只能写 `portForwards` 一对一映射。开 vmnet shared 后 VM 多出 `lima0` 接口
+拿到 `192.168.105.x`，**Mac 直接 ping/curl 这个 IP 通**，不需要 portForward：
+
+```bash
+# 在 VM 内
+sudo mydocker run -d -p 8080:80 nginx
+
+# Mac 上直接 curl（如果 Mac 有 http_proxy，加 --noproxy '*'）
+curl --noproxy '*' http://192.168.105.2:8080
+```
+
+如果还想让 Mac 直接访问容器 IP（10.22.x.x），加一条静态路由（重启失效）：
+
+```bash
+sudo route -nv add -net 10.22.0.0/16 192.168.105.2
+```
+
+> ⚠️ `vm:setup-vmnet` 是一次性的，第二次运行无害但要重输密码。
+
+### 不用 lima 的其它选项
+
+- multipass、UTM、Vagrant、Parallels：自己手动起 Ubuntu VM，把 `bin/` scp 进去
+- 远程 Linux：`task build:linux` 交叉编译，`scp` 到目标机器
 
 ## 构建
 
 ```bash
-make build-linux       # 交叉编译到 linux/amd64，产物 bin/mydocker{,-cri}
-make vet               # 静态检查
-make test              # 单元测试（所有 _test.go）
+task                    # 列出全部可用任务
+task build              # 本机构建（非 Linux 平台会打 WARN）
+task build:linux        # 交叉编译到 linux/amd64，产物 bin/mydocker{,-cri}
+task build:linux-arm64  # 交叉编译到 linux/arm64
+task vet                # 静态检查
+task test               # 单元测试（所有 _test.go）
+task clean              # 清理 bin/
+
+# 运行类（仅 Linux）
+task smoke:l1           # L1 namespace + cgroup + rootfs 冒烟
+task e2e:docker         # L2 完整 Docker 功能 e2e（22 项）
+task smoke:l3           # L3 CRI 冒烟
+task e2e:kubeadm        # L4B kubeadm init 端到端
 ```
 
 ---

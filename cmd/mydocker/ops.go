@@ -203,6 +203,10 @@ func removeContainer(ref string, force bool) error {
 		teardownNetwork(c)
 		_ = sendKill(c.PID)
 		time.Sleep(200 * time.Millisecond)
+	} else {
+		// 容器已经不再 Running（Exited / Created），但它的 CNI 留下的 iptables
+		// 规则、IPAM 占用、veth peer 等仍可能残留——必须 best-effort 清理一次。
+		teardownNetwork(c)
 	}
 
 	if c.CgroupPath != "" {
@@ -225,9 +229,9 @@ func removeContainer(ref string, force bool) error {
 // teardownNetwork 在容器被停止之前调用 CNI DEL，释放 IP、veth、端口映射。
 // libcni 内部把首次 ADD 的参数缓存到 /var/lib/cni/cache/，DEL 时会自动复用，
 // 所以这里不需要再显式传 ports / capabilityArgs。
-// 幂等：没网络 / CNI 未加载 / 已 down 都不会报错。
+// 幂等：没网络 / CNI 未加载 / 已 down / 容器已退出 都不会报错。
 func teardownNetwork(c *store.Container) {
-	if c.NetworkMode != "bridge" || c.PID == 0 {
+	if c.NetworkMode != "bridge" {
 		return
 	}
 
@@ -241,7 +245,17 @@ func teardownNetwork(c *store.Container) {
 	if err != nil || !mgr.Ready() {
 		return
 	}
-	netns := fmt.Sprintf("/proc/%d/ns/net", c.PID)
+
+	// netns 路径：进程还活着就用 /proc/<pid>/ns/net；否则传空字符串，
+	// libcni 会跳过进入 netns 的步骤（仅清理 host 侧 iptables / IPAM 等）。
+	netns := ""
+	if c.PID > 0 && pidAlive(c.PID) {
+		candidate := fmt.Sprintf("/proc/%d/ns/net", c.PID)
+		if _, err := os.Stat(candidate); err == nil {
+			netns = candidate
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := mgr.Teardown(ctx, c.ID, netns, "eth0"); err != nil {

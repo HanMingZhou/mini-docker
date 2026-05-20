@@ -67,7 +67,7 @@ else
 fi
 
 if [[ ! -x /opt/cni/bin/bridge ]]; then
-    fail "/opt/cni/bin/bridge missing — run vm-deploy.sh"
+    fail "/opt/cni/bin/bridge missing — run scripts/install-cni.sh"
 else
     ok "CNI bridge plugin present"
 fi

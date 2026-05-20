@@ -3,17 +3,27 @@
 package cri
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
 )
 
 // pidAlive returns true if a process with the given pid exists.
+//
+// Uses kill(pid, 0):
+//   - nil  → process exists and we have permission
+//   - EPERM → process exists but we lack permission (still alive!)
+//   - ESRCH → process does not exist
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, syscall.EPERM)
 }
 
 func sendTerm(pid int) error { return syscall.Kill(pid, syscall.SIGTERM) }
