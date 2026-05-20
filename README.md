@@ -2,6 +2,10 @@
 
 A from-scratch container engine **and** Kubernetes CRI runtime, built for learning.
 
+<p align="center">
+  <img src="docs/mydocker.png" alt="mini-docker" width="520">
+</p>
+
 这是一个 4 级递进的容器化实现：
 
 | Level | 目标 | 状态 |
@@ -155,6 +159,12 @@ sudo ./mydocker run -it \
 sudo ROOTFS=./rootfs-busybox ./scripts/smoke-l1.sh
 ```
 
+CLI 长这样：
+
+<p align="center">
+  <img src="docs/mydocker-command.png" alt="mydocker CLI 子命令" width="800">
+</p>
+
 ---
 
 ## Level 2：完整 Docker 功能
@@ -184,6 +194,26 @@ e2e 覆盖：
 - build（Dockerfile）
 - save / load
 - push / pull（需要配置 registry，跳过时打 skip）
+
+### Demo：起 nginx + 端口映射
+
+```bash
+sudo mydocker image pull nginx
+sudo mydocker run -d --name web -p 8080:80 nginx
+curl --noproxy '*' http://192.168.105.2:8080      # macOS 宿主机直连 lima VM
+```
+
+宿主 `curl` 拿到 nginx 默认页：
+
+<p align="center">
+  <img src="docs/mydocker-nginx-curl.png" alt="curl nginx 端口映射" width="800">
+</p>
+
+浏览器访问同一地址：
+
+<p align="center">
+  <img src="docs/mydocker-nginx-web.png" alt="浏览器访问 mydocker 容器中的 nginx" width="800">
+</p>
 
 ---
 
