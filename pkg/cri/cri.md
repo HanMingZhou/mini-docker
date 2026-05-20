@@ -1,26 +1,24 @@
-RuntimeService 与 ImageService
-它们是 Kubernetes CRI (Container Runtime Interface) 协议定义的两个 gRPC 服务，是 Kubelet 与底层容器运行时（containerd / cri-o / 本项目的 mydocker-cri）之间的唯一标准接口。
+# RuntimeService 与 ImageService
+它们是 Kubernetes CRI (Container Runtime Interface) 协议定义的两个 gRPC 服务，是 Kubelet 与底层容器运行时（containerd / cri-o / ）之间的唯一标准接口。
+定义文件在 Kubernetes 源码 k8s.io/cri-api/pkg/apis/runtime/v1/api.proto
 
-定义文件在 Kubernetes 源码 k8s.io/cri-api/pkg/apis/runtime/v1/api.proto，本项目通过 import runtime "k8s.io/cri-api/pkg/apis/runtime/v1" 引入。
-
-一、为什么要有这两个服务？
+## 一、为什么要有这两个服务？
 历史背景：Kubernetes 早期硬编码 Docker 作为运行时（叫 dockershim），代码耦合非常严重。2016 年 K8s 抽象出 CRI，让 Kubelet 只面向一个稳定的 gRPC 接口编程，谁实现这个接口谁就能当 K8s 的运行时。
 
 职责切分逻辑：
+维度	        RuntimeService	            ImageService
+关心的对象	     进程 / namespace / cgroup	      镜像文件 / layer / registry
+状态	        有状态（运行中的 Pod、容器）	    主要操作本地存储
+生命周期	     频繁变化（启停容器、Exec）	        慢变化（pull、删除）
+谁调用	        Kubelet 主循环	                 Kubelet 的 image manager（独立 goroutine）
 
-维度	RuntimeService	ImageService
-关心的对象	进程 / namespace / cgroup	镜像文件 / layer / registry
-状态	有状态（运行中的 Pod、容器）	主要操作本地存储
-生命周期	频繁变化（启停容器、Exec）	慢变化（pull、删除）
-谁调用	Kubelet 主循环	Kubelet 的 image manager（独立 goroutine）
 把镜像 RPC 单独切出来，可以让 Kubelet 在 pull 大镜像时不阻塞容器生命周期管理，也方便实现侧把镜像存储完全独立出来（理论上甚至可以是另一个 daemon）。
 
-二、RuntimeService 是什么
+## 二、RuntimeService 是什么
 一句话：管理"正在跑的东西"——Pod 沙箱、容器、Exec 通道、运行时状态。
 
 它的 server 端骨架：
-
-server.go:232-241
+```go
 // RuntimeService 是 CRI RuntimeService 的实现。
 type RuntimeService struct {
     runtime.UnimplementedRuntimeServiceServer
@@ -31,35 +29,155 @@ type RuntimeService struct {
     cgroupDriver   cgroup.Driver
     mydockerBinary string
 }
+```
 runtime.UnimplementedRuntimeServiceServer 是 gRPC protoc 生成的"默认空实现"，把所有 RPC 默认返回 Unimplemented 错误。你只需要"重写"自己想支持的方法，没重写的自动 fallback。本项目几乎重写了所有方法。
 
+UnimplementedRuntimeServiceServer 是 gRPC 在 Go 里的一个前向兼容机制。理解它需要分三层：proto 定义 → protoc 生成代码 → 你的实现
+### 一、背景：gRPC 的 service 在 Go 里是 interface
+CRI 在 proto 里定义了一个 service：
+```go
+service RuntimeService {
+    rpc Version(VersionRequest) returns (VersionResponse) {}
+    rpc RunPodSandbox(RunPodSandboxRequest) returns (RunPodSandboxResponse) {}
+    rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse) {}
+    // ... 还有 20 多个 RPC
+}
+```
+protoc-gen-go-grpc 看到 service 关键字，会自动生成一个 Go interface（在 k8s.io/cri-api 包里）：
+```go
+type RuntimeServiceServer interface {
+    Version(context.Context, *VersionRequest) (*VersionResponse, error)
+    RunPodSandbox(context.Context, *RunPodSandboxRequest) (*RunPodSandboxResponse, error)
+    CreateContainer(context.Context, *CreateContainerRequest) (*CreateContainerResponse, error)
+    // ... 25+ 个方法
+}
+```
+而 runtime.RegisterRuntimeServiceServer(grpcServer, impl) 要求传进来的 impl 必须满足这整个 interface——一个方法都不能少，否则编译失败。
+
+### 二、问题：interface 演进 vs 你的代码
+CRI 是 Kubernetes 项目维护的，每个 K8s 版本可能给 RuntimeServiceServer 加新方法。比如 v1.27 加了 CheckpointContainer，v1.28 加了 ListMetricDescriptors。
+
+如果 gRPC 只生成 interface，那么：
+你今天实现了 25 个方法，编译通过
+升级 cri-api 到下一版，interface 多了 1 个方法
+你的代码立刻编译失败，哪怕你完全用不到那个新方法
+这对生态来说是灾难——所有运行时实现者都被强制跟版本。
+
+解法：生成一个"全是空方法"的结构体
+protoc-gen-go-grpc 在生成 interface 的同时，还生成一个配套的 struct：
+
+```go
+// 由 protoc 自动生成（不是手写的）
+type UnimplementedRuntimeServiceServer struct{}
+ 
+func (UnimplementedRuntimeServiceServer) Version(context.Context, *VersionRequest) (*VersionResponse, error) {
+    return nil, status.Errorf(codes.Unimplemented, "method Version not implemented")
+}
+func (UnimplementedRuntimeServiceServer) RunPodSandbox(context.Context, *RunPodSandboxRequest) (*RunPodSandboxResponse, error) {
+    return nil, status.Errorf(codes.Unimplemented, "method RunPodSandbox not implemented")
+}
+// ... 每个 RPC 都有一个"返回 Unimplemented 错误"的默认实现
+```
+
+这个 struct 自动满足 RuntimeServiceServer interface 的所有方法。
+
+关键技巧：Go 的"嵌入"（embedding）
+现在看本项目的代码：
+```go
+type RuntimeService struct {
+    runtime.UnimplementedRuntimeServiceServer
+ 
+    sandboxMgr     *sandbox.Manager
+    streaming      StreamingServer
+    cni            *network.Manager
+    cgroupDriver   cgroup.Driver
+    mydockerBinary string
+}
+```
+第一行 runtime.UnimplementedRuntimeServiceServer（没有字段名）是 Go 的结构体嵌入语法。它的效果是：
+RuntimeService 自动"继承"了 UnimplementedRuntimeServiceServer 的所有方法。
+所以一开始，RuntimeService 就已经满足了整个 RuntimeServiceServer interface——所有 RPC 都返回 Unimplemented 错误。
+
+然后你只需要写自己想支持的方法：
+```go
+func (s *RuntimeService) Version(...) (...) { ... }  // 重写
+func (s *RuntimeService) RunPodSandbox(...) (...) { ... }  // 重写
+```
+Go 的方法解析规则是"外层方法优先于嵌入字段的方法"，所以你写的 Version 会覆盖嵌入的那个返回 Unimplemented 的版本。没写的方法继续走嵌入的默认实现。
+
+举个具体例子
+假设你只实现了 Version 和 Status：
+```go
+type RuntimeService struct {
+    runtime.UnimplementedRuntimeServiceServer
+}
+ 
+func (s *RuntimeService) Version(...) (*VersionResponse, error) {
+    return &VersionResponse{...}, nil
+}
+func (s *RuntimeService) Status(...) (*StatusResponse, error) {
+    return &StatusResponse{...}, nil
+}
+```
+效果：
+Kubelet 调用	实际触发	返回
+Version	你写的方法	正常响应
+Status	你写的方法	正常响应
+RunPodSandbox	嵌入的默认方法	gRPC error: Unimplemented
+CreateContainer	嵌入的默认方法	gRPC error: Unimplemented
+代码编译通过、可以注册到 gRPC server，只是大部分 RPC 客户端调用时会拿到 Unimplemented 错误。
+
+本项目的实际情况
+"本项目几乎重写了所有方法"
+意思是：在 pkg/cri/ 各个文件里，*RuntimeService 已经显式实现了：
+server.go: Version, Status
+sandbox.go: RunPodSandbox, StopPodSandbox, RemovePodSandbox, PodSandboxStatus, ListPodSandbox
+container.go: CreateContainer, StartContainer, StopContainer, RemoveContainer, ContainerStatus, ListContainers
+exec.go: ExecSync, Exec, Attach, PortForward
+stats.go: ContainerStats, ListContainerStats, PodSandboxStats, ListPodSandboxStats, UpdateRuntimeConfig, UpdateContainerResources, ReopenContainerLog
+这覆盖了 Kubelet 实际会调用的所有 RPC。没覆盖的（比如 CheckpointContainer、GetContainerEvents、ListMetricDescriptors、ListPodSandboxMetrics 这些较新或可选的 RPC）就自动走嵌入的默认实现，返回 Unimplemented，Kubelet 收到这个错误码会优雅降级（不当成致命错误）。
+
+ImageService 也是同样的模式：
+```go
+type ImageService struct {
+    runtime.UnimplementedImageServiceServer
+ 
+    root string // 数据根目录
+}
+```
+七、一句话总结
+UnimplementedXxxServer 是 protoc 自动生成的"打底空壳"，通过 Go 的结构体嵌入让你的实现默认满足整个 interface；你只需要"挑你关心的 RPC 重写一下"，未来 cri-api 加新方法也不会破坏你的代码——这就是 gRPC Go 的前向兼容约定。
+
+题外话：这个模式在 gRPC Go 里是强烈推荐做法，新版本的 protoc-gen-go-grpc 甚至默认要求你必须嵌入它，否则编译会拒绝（require_unimplemented_servers=true）。
+
+
 RuntimeService 的 RPC 大类
-类别	典型 RPC	本项目位置
-握手/心跳	Version、Status	server.go:261-286
-Pod 沙箱	RunPodSandbox / StopPodSandbox / RemovePodSandbox / PodSandboxStatus / ListPodSandbox	sandbox.go
+类别	    典型 RPC	        本项目位置
+握手/心跳	Version、Status	        server.go:261-286
+Pod 沙箱	RunPodSandbox / StopPodSandbox / RemovePodSandbox / PodSandboxStatus / ListPodSandbox   sandbox.go
 容器	CreateContainer / StartContainer / StopContainer / RemoveContainer / ContainerStatus / ListContainers	container.go
 执行	ExecSync / Exec / Attach / PortForward	exec.go
-统计与配置	ContainerStats / ListContainerStats / PodSandboxStats / UpdateRuntimeConfig / UpdateContainerResources / ReopenContainerLog	stats.go
-关键概念：什么是 Pod 沙箱？
-CRI 把"Pod"分成两层：
+统计与配置	ContainerStats / ListContainerStats / PodSandboxStats / UpdateRuntimeConfig / UpdateContainerResources / ReopenContainerLog     stats.go
 
+### 关键概念：什么是 Pod 沙箱？
+CRI 把"Pod"分成两层：
 Sandbox（沙箱）：先创建的"壳"，持有 Pod 级的 网络命名空间、IPC 命名空间、cgroup 父目录、Pod IP，本身通常只跑一个轻量 pause 进程，永不退出。
 Container（容器）：在沙箱之上，加入沙箱的 network/IPC/UTS 命名空间，但有自己的 PID/Mount 命名空间和镜像 rootfs。
-本项目的体现：
 
-container.go:233-238
+本项目的体现：
+```go
 // Build JoinNS map: container joins sandbox's net/ipc/uts
 joinNS := map[string]string{
     "net": fmt.Sprintf("/proc/%d/ns/net", sb.PID),
     "ipc": fmt.Sprintf("/proc/%d/ns/ipc", sb.PID),
     "uts": fmt.Sprintf("/proc/%d/ns/uts", sb.PID),
 }
+```
 这样同一个 Pod 里的多个容器（业务 + sidecar）就能 localhost 互通、看到同一组 SysV IPC，但各自有独立的进程视图和文件系统视图。
 
 心跳：Status RPC
 Kubelet 每隔几秒调用一次 Status，问两个布尔：
-
-server.go:273-286
+```go
 func (s *RuntimeService) Status(_ context.Context, _ *runtime.StatusRequest) (*runtime.StatusResponse, error) {
     networkReady := false
     if s.cni != nil {
@@ -74,29 +192,29 @@ func (s *RuntimeService) Status(_ context.Context, _ *runtime.StatusRequest) (*r
         },
     }, nil
 }
+```
 RuntimeReady=false → Kubelet 把 Node 标记为 NotReady，不再调度新 Pod
 NetworkReady=false → Kubelet 只允许 hostNetwork: true 的 Pod 启动（这就是为什么 kubeadm init 时 CoreDNS 一直 Pending —— 它不是 hostNetwork）
+
 Kubelet 的典型调用顺序（创建一个 Pod）
 1. PullImage(image)              ── ImageService
 2. RunPodSandbox(podConfig)      ── RuntimeService → 拿到 sandboxId, podIP
 3. CreateContainer(sandboxId, containerConfig)  ── RuntimeService → 拿到 containerId
 4. StartContainer(containerId)   ── RuntimeService
 5. (循环) ContainerStatus / Status  ── RuntimeService 心跳
-三、ImageService 是什么
+
+## 三、ImageService 是什么
 一句话：管理"镜像仓库"——pull、list、删除、查盘占用。
-
-它的 server 端就是你光标停的这几行：
-
-server.go:295-303
+```go
 type ImageService struct {
     runtime.UnimplementedImageServiceServer
  
     root string // 数据根目录
 }
- 
 func newImageService(root string) *ImageService {
     return &ImageService{root: root}
 }
+ ```
 注意它只有一个字段 root——这就是 ImageService 的本质：它只是一个建立在数据目录上的镜像 CRUD 服务，与正在跑的容器完全无关。
 
 ImageService 的 RPC 全集（只有 5 个）
@@ -106,12 +224,11 @@ ListImages	列出本地所有镜像	image.go:56-74
 ImageStatus	查询单个镜像（含 size、digest）	image.go:77-94
 RemoveImage	删除本地镜像	image.go:97-117
 ImageFsInfo	镜像存储盘的使用量（给 Kubelet 做 disk pressure 判断）	image.go:120-147
+
 对比一下：RuntimeService 大概 25+ 个 RPC，ImageService 只有 5 个，因为镜像操作本质简单。
-
 CRI 镜像约定中的两个细节
-1. ImageStatus 找不到镜像不是错误：
-
-image.go:85-94
+### 1. ImageStatus 找不到镜像不是错误：
+```go
 m, err := is.Resolve(req.Image.Image)
 if err != nil {
     return nil, err
@@ -121,11 +238,12 @@ if m == nil {
     return &runtime.ImageStatusResponse{}, nil
 }
 return &runtime.ImageStatusResponse{Image: manifestToProto(m)}, nil
+```
 Kubelet 用 ImageStatus 检查"镜像在不在本地"，靠 response.Image == nil 判断。如果返回错误，Kubelet 会以为运行时挂了。
 
-2. ImageFsInfo 决定 Node 的 DiskPressure 状态：Kubelet 用这个值与 --eviction-hard imagefs.available<10% 比较，超过阈值就开始驱逐 Pod。
+### 2. ImageFsInfo 决定 Node 的 DiskPressure 状态：Kubelet 用这个值与 --eviction-hard imagefs.available<10% 比较，超过阈值就开始驱逐 Pod。
 
-四、两者怎么协作？以 mini-docker 为例
+## 四、两者怎么协作？以 mini-docker 为例
                 ┌────────────────────────────────────┐
                 │       grpc.Server (单个进程)        │
                 │                                    │
@@ -143,163 +261,35 @@ crictl  ───────►│       │             container, store
                   ├── containers/  ← RuntimeService 写
                   └── sandboxes/   ← RuntimeService 写
 两个 service 在同一个 gRPC server 上注册，共用 socket：
-
-server.go:207-208
+```go
 runtime.RegisterRuntimeServiceServer(s.grpc, s.runtime)
 runtime.RegisterImageServiceServer(s.grpc, s.image)
+```
 它们之间不直接调用对方，而是通过共享的 root 目录（/var/lib/mydocker/）解耦：
 
 ImageService.PullImage 把 layer 写到 root/layers/、manifest 写到 root/images/
 RuntimeService.CreateContainer 读 root/images/<name>/manifest.json，用 overlayfs 在 root/containers/<id>/ 把 layer 组装成 rootfs
 这种"通过文件系统解耦"的设计就是 CRI 拆分两个 service 的目的——理论上 ImageService 可以是完全独立的 daemon 写到共享卷，RuntimeService 只读。
 
-五、Kubelet 怎么连这两个 service？
+## 五、Kubelet 怎么连这两个 service
 /etc/crictl.yaml 和 Kubelet 启动参数都有两个 endpoint：
-
-yaml
+```yaml
 runtime-endpoint: unix:///var/run/mydocker-cri.sock
 image-endpoint:   unix:///var/run/mydocker-cri.sock
+```
 99% 情况两个值相同（同一个 daemon），但协议允许不同，例如：
-
 用 containerd 跑容器
 用 stargz-snapshotter 作为独立 image 服务做懒加载
 这就是上一轮回答里"协议允许但通常不这么用"的具体含义。
 
-六、记忆口诀
+## 六、记忆口诀
 RuntimeService = "动的东西"：Pod、容器、进程、Exec、Stats
 ImageService = "静的东西"：镜像文件、磁盘占用
 两者通过 CRI 协议统一接口，通过 共享数据目录解耦实现
-需要我继续深入哪个？比如 RuntimeService 里 RunPodSandbox 的完整调用链（pause 进程怎么起、CNI 什么时候挂网卡）、或者 ImageService 里 layer 是怎么按 digest 去重存储的？
-
-Feedback submitted
 
 
 
-"runtime.UnimplementedRuntimeServiceServer 是 gRPC protoc 生成的"默认空实现"，把所有 RPC 默认返回 Unimplemented 错误。你只需要"重写"自己想支持的方法，没重写的自动 fallback。本项目几乎重写了所有方法。" 是什么意思
 
-解释：UnimplementedRuntimeServiceServer 是什么
-这是 gRPC 在 Go 里的一个前向兼容机制。理解它需要分三层：proto 定义 → protoc 生成代码 → 你的实现。
-
-一、背景：gRPC 的 service 在 Go 里是 interface
-CRI 在 proto 里定义了一个 service：
-
-proto
-service RuntimeService {
-    rpc Version(VersionRequest) returns (VersionResponse) {}
-    rpc RunPodSandbox(RunPodSandboxRequest) returns (RunPodSandboxResponse) {}
-    rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse) {}
-    // ... 还有 20 多个 RPC
-}
-protoc-gen-go-grpc 看到 service 关键字，会自动生成一个 Go interface（在 k8s.io/cri-api 包里）：
-
-go
-type RuntimeServiceServer interface {
-    Version(context.Context, *VersionRequest) (*VersionResponse, error)
-    RunPodSandbox(context.Context, *RunPodSandboxRequest) (*RunPodSandboxResponse, error)
-    CreateContainer(context.Context, *CreateContainerRequest) (*CreateContainerResponse, error)
-    // ... 25+ 个方法
-}
-而 runtime.RegisterRuntimeServiceServer(grpcServer, impl) 要求传进来的 impl 必须满足这整个 interface——一个方法都不能少，否则编译失败。
-
-二、问题：interface 演进 vs 你的代码
-CRI 是 Kubernetes 项目维护的，每个 K8s 版本可能给 RuntimeServiceServer 加新方法。比如 v1.27 加了 CheckpointContainer，v1.28 加了 ListMetricDescriptors。
-
-如果 gRPC 只生成 interface，那么：
-
-你今天实现了 25 个方法，编译通过
-升级 cri-api 到下一版，interface 多了 1 个方法
-你的代码立刻编译失败，哪怕你完全用不到那个新方法
-这对生态来说是灾难——所有运行时实现者都被强制跟版本。
-
-三、解法：生成一个"全是空方法"的结构体
-protoc-gen-go-grpc 在生成 interface 的同时，还生成一个配套的 struct：
-
-go
-// 由 protoc 自动生成（不是手写的）
-type UnimplementedRuntimeServiceServer struct{}
- 
-func (UnimplementedRuntimeServiceServer) Version(context.Context, *VersionRequest) (*VersionResponse, error) {
-    return nil, status.Errorf(codes.Unimplemented, "method Version not implemented")
-}
-func (UnimplementedRuntimeServiceServer) RunPodSandbox(context.Context, *RunPodSandboxRequest) (*RunPodSandboxResponse, error) {
-    return nil, status.Errorf(codes.Unimplemented, "method RunPodSandbox not implemented")
-}
-// ... 每个 RPC 都有一个"返回 Unimplemented 错误"的默认实现
-这个 struct 自动满足 RuntimeServiceServer interface 的所有方法。
-
-四、关键技巧：Go 的"嵌入"（embedding）
-现在看本项目的代码：
-
-server.go:233-241
-type RuntimeService struct {
-    runtime.UnimplementedRuntimeServiceServer
- 
-    sandboxMgr     *sandbox.Manager
-    streaming      StreamingServer
-    cni            *network.Manager
-    cgroupDriver   cgroup.Driver
-    mydockerBinary string
-}
-第一行 runtime.UnimplementedRuntimeServiceServer（没有字段名）是 Go 的结构体嵌入语法。它的效果是：
-
-RuntimeService 自动"继承"了 UnimplementedRuntimeServiceServer 的所有方法。
-
-所以一开始，RuntimeService 就已经满足了整个 RuntimeServiceServer interface——所有 RPC 都返回 Unimplemented 错误。
-
-然后你只需要写自己想支持的方法：
-
-go
-func (s *RuntimeService) Version(...) (...) { ... }  // 重写
-func (s *RuntimeService) RunPodSandbox(...) (...) { ... }  // 重写
-Go 的方法解析规则是"外层方法优先于嵌入字段的方法"，所以你写的 Version 会覆盖嵌入的那个返回 Unimplemented 的版本。没写的方法继续走嵌入的默认实现。
-
-五、举个具体例子
-假设你只实现了 Version 和 Status：
-
-go
-type RuntimeService struct {
-    runtime.UnimplementedRuntimeServiceServer
-}
- 
-func (s *RuntimeService) Version(...) (*VersionResponse, error) {
-    return &VersionResponse{...}, nil
-}
-func (s *RuntimeService) Status(...) (*StatusResponse, error) {
-    return &StatusResponse{...}, nil
-}
-效果：
-
-Kubelet 调用	实际触发	返回
-Version	你写的方法	正常响应
-Status	你写的方法	正常响应
-RunPodSandbox	嵌入的默认方法	gRPC error: Unimplemented
-CreateContainer	嵌入的默认方法	gRPC error: Unimplemented
-代码编译通过、可以注册到 gRPC server，只是大部分 RPC 客户端调用时会拿到 Unimplemented 错误。
-
-六、本项目的实际情况
-"本项目几乎重写了所有方法"
-
-意思是：在 pkg/cri/ 各个文件里，*RuntimeService 已经显式实现了：
-
-server.go: Version, Status
-sandbox.go: RunPodSandbox, StopPodSandbox, RemovePodSandbox, PodSandboxStatus, ListPodSandbox
-container.go: CreateContainer, StartContainer, StopContainer, RemoveContainer, ContainerStatus, ListContainers
-exec.go: ExecSync, Exec, Attach, PortForward
-stats.go: ContainerStats, ListContainerStats, PodSandboxStats, ListPodSandboxStats, UpdateRuntimeConfig, UpdateContainerResources, ReopenContainerLog
-这覆盖了 Kubelet 实际会调用的所有 RPC。没覆盖的（比如 CheckpointContainer、GetContainerEvents、ListMetricDescriptors、ListPodSandboxMetrics 这些较新或可选的 RPC）就自动走嵌入的默认实现，返回 Unimplemented，Kubelet 收到这个错误码会优雅降级（不当成致命错误）。
-
-ImageService 也是同样的模式：
-
-server.go:295-299
-type ImageService struct {
-    runtime.UnimplementedImageServiceServer
- 
-    root string // 数据根目录
-}
-七、一句话总结
-UnimplementedXxxServer 是 protoc 自动生成的"打底空壳"，通过 Go 的结构体嵌入让你的实现默认满足整个 interface；你只需要"挑你关心的 RPC 重写一下"，未来 cri-api 加新方法也不会破坏你的代码——这就是 gRPC Go 的前向兼容约定。
-
-题外话：这个模式在 gRPC Go 里是强烈推荐做法，新版本的 protoc-gen-go-grpc 甚至默认要求你必须嵌入它，否则编译会拒绝（require_unimplemented_servers=true）。
 
 
 
