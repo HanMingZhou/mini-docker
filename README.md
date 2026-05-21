@@ -365,6 +365,21 @@ sudo mydocker logs <container>
 - [x] L4B：**`kubeadm init` 在 mydocker-cri 上拉起完整控制面**（etcd + apiserver + controller-manager + scheduler）
 - [x] CoreDNS / kube-system 全 Pod Running（容器 `/etc/{resolv.conf,hosts,hostname}` 由 mydocker-cri 注入）
 - [x] **多节点 `kubeadm join`**（两个 lima VM，control-plane + worker，都跑 `mydocker://0.1.0`）
+- [x] 多节点 nginx Deployment 调度 + ClusterIP / NodePort Service：scheduler / kube-proxy / DNS / iptables 全部端到端工作
+
+### 已知限制
+
+- **跨节点 Pod 网络不通**：mydocker 的 CNI 是 `bridge + host-local IPAM`（单节点教学版），
+  每个节点都拿 `10.22.0.0/16` 整段，没有节点间路由。生产 K8s 通过 Flannel /
+  Calico / Cilium 这类"集群级 CNI"解决。所以当一个 Pod 落在 worker 上、
+  Service 流量被 DNAT 到它时，从 CP 访问会 timeout。把 Deployment 钉到单节点
+  （`nodeSelector`）就 100% OK。
+
+  下一阶段（如有）：实现 per-node subnet + VXLAN，或者直接接现成的 Flannel。
+- **`kubectl logs` 不工作**：mydocker-cri 没把容器 stdio 包成 CRI log format
+  （`<RFC3339> <stream> <P|F> <line>`），kubelet log parser 失败。
+  容器实际日志可以通过 `crictl logs` 或直接 `cat /var/log/pods/.../<n>.log`
+  查看。修法：在 `pkg/container/container_linux.go` 给 stdio 加包装层，~50 行。
 
 ---
 
