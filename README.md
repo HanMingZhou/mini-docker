@@ -363,7 +363,7 @@ sudo mydocker logs <container>
 - [x] L3：`crictl info`、`crictl pull`、`crictl runp/create/start/exec` 全通
 - [x] L4A：standalone kubelet 从 manifest 把 Pod 拉起来、自恢复、外部能 curl
 - [x] L4B：**`kubeadm init` 在 mydocker-cri 上拉起完整控制面**（etcd + apiserver + controller-manager + scheduler）
-- [ ] CoreDNS / 自定义 Pod（非 hostNetwork）调度 — 需要 CNI 对 Pod 网络做更完整的支持
+- [x] CoreDNS / kube-system 全 Pod Running（容器 `/etc/{resolv.conf,hosts,hostname}` 由 mydocker-cri 注入）
 - [ ] 多节点 `kubeadm join`
 
 ---

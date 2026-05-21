@@ -40,6 +40,21 @@ type Metadata struct {
 	Attempt   uint32 `json:"attempt"`
 }
 
+// HostAlias maps an IP address to one or more hostnames; written into
+// /etc/hosts of every container in the sandbox.
+type HostAlias struct {
+	IP        string   `json:"ip"`
+	Hostnames []string `json:"hostnames"`
+}
+
+// DNSConfig captures the resolv.conf-relevant fields the sandbox should
+// hand down to its containers (mirrors CRI DNSConfig).
+type DNSConfig struct {
+	Servers  []string `json:"servers,omitempty"`
+	Searches []string `json:"searches,omitempty"`
+	Options  []string `json:"options,omitempty"`
+}
+
 // Sandbox 是一个沙箱的完整持久化元数据。
 type Sandbox struct {
 	ID           string            `json:"id"`
@@ -54,6 +69,11 @@ type Sandbox struct {
 	LogDir       string            `json:"log_directory,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
 	Annotations  map[string]string `json:"annotations,omitempty"`
+
+	// /etc/* generation inputs (used by CRI when preparing per-container rootfs).
+	Hostname    string      `json:"hostname,omitempty"`
+	DNS         DNSConfig   `json:"dns,omitempty"`
+	HostAliases []HostAlias `json:"host_aliases,omitempty"`
 }
 
 // Manager 是沙箱的对外入口。
@@ -109,6 +129,12 @@ type StartOptions struct {
 	Annotations  map[string]string
 	CgroupParent string
 	HostNetwork  bool // true = 不创建新 netns，共享宿主机网络（hostNetwork Pod）
+
+	// /etc/* 生成所需输入；为空时使用合理默认（hostname=metadata.name，
+	// DNS 留空让 CRI 层兜底）。
+	Hostname    string
+	DNS         DNSConfig
+	HostAliases []HostAlias
 }
 
 // Start 创建并启动一个新沙箱。

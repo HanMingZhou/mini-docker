@@ -48,6 +48,9 @@ func (m *Manager) start(md Metadata, opts StartOptions) (*Sandbox, error) {
 			LogDir:       opts.LogDir,
 			Labels:       opts.Labels,
 			Annotations:  opts.Annotations,
+			Hostname:     opts.Hostname,
+			DNS:          opts.DNS,
+			HostAliases:  opts.HostAliases,
 		}
 		if err := m.save(sb); err != nil {
 			_ = os.RemoveAll(sbDir)
@@ -100,6 +103,9 @@ func (m *Manager) start(md Metadata, opts StartOptions) (*Sandbox, error) {
 		LogDir:       opts.LogDir,
 		Labels:       opts.Labels,
 		Annotations:  opts.Annotations,
+		Hostname:     opts.Hostname,
+		DNS:          opts.DNS,
+		HostAliases:  opts.HostAliases,
 	}
 
 	// 基础校验：/proc/<pid>/ns/net 应可 stat（在调 CNI 之前）
