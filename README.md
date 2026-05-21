@@ -364,7 +364,7 @@ sudo mydocker logs <container>
 - [x] L4A：standalone kubelet 从 manifest 把 Pod 拉起来、自恢复、外部能 curl
 - [x] L4B：**`kubeadm init` 在 mydocker-cri 上拉起完整控制面**（etcd + apiserver + controller-manager + scheduler）
 - [x] CoreDNS / kube-system 全 Pod Running（容器 `/etc/{resolv.conf,hosts,hostname}` 由 mydocker-cri 注入）
-- [ ] 多节点 `kubeadm join`
+- [x] **多节点 `kubeadm join`**（两个 lima VM，control-plane + worker，都跑 `mydocker://0.1.0`）
 
 ---
 

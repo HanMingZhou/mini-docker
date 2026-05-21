@@ -187,8 +187,15 @@ kubeadm_reset_clean() {
 
 # --------------------------------------------------------------------- 12
 kubeadm_init() {
+    # 优先用 lima vmnet shared 网络的 IP（如有）作为 apiserver advertise address。
+    # 这样 worker 节点（同样在 192.168.105.x 网段）能直接访问到控制面，
+    # 且 apiserver 的 TLS 证书会包含正确的 IP SAN。eth0 是 lima user-mode
+    # NAT，跨 VM 不可达。
     local IP
-    IP=$(ip -4 addr show eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
+    IP=$(ip -4 addr show lima0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
+    if [ -z "$IP" ]; then
+        IP=$(ip -4 addr show eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
+    fi
     echo "==> using node IP: $IP"
     # 关键：lima 默认设置 http_proxy 指向 host (192.168.5.2:7890)，
     # 这会让 kubeadm 的 healthcheck 走代理，结果代理打不通本机 6443，超时失败。
