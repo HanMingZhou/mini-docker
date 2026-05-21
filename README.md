@@ -366,6 +366,7 @@ sudo mydocker logs <container>
 - [x] CoreDNS / kube-system 全 Pod Running（容器 `/etc/{resolv.conf,hosts,hostname}` 由 mydocker-cri 注入）
 - [x] **多节点 `kubeadm join`**（两个 lima VM，control-plane + worker，都跑 `mydocker://0.1.0`）
 - [x] 多节点 nginx Deployment 调度 + ClusterIP / NodePort Service：scheduler / kube-proxy / DNS / iptables 全部端到端工作
+- [x] **`kubectl logs` 工作**（CRI log format `<RFC3339Nano> <stream> <P|F> <line>` 包装在 `pkg/container/crilog.go`）
 
 ### 已知限制
 
@@ -376,10 +377,6 @@ sudo mydocker logs <container>
   （`nodeSelector`）就 100% OK。
 
   下一阶段（如有）：实现 per-node subnet + VXLAN，或者直接接现成的 Flannel。
-- **`kubectl logs` 不工作**：mydocker-cri 没把容器 stdio 包成 CRI log format
-  （`<RFC3339> <stream> <P|F> <line>`），kubelet log parser 失败。
-  容器实际日志可以通过 `crictl logs` 或直接 `cat /var/log/pods/.../<n>.log`
-  查看。修法：在 `pkg/container/container_linux.go` 给 stdio 加包装层，~50 行。
 
 ---
 
