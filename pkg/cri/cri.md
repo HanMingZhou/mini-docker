@@ -236,12 +236,12 @@ func (s *Server) Start() error {
 }
 ```
 逻辑很直白：
-net.Listen("unix", s.cfg.Socket) —— 在文件系统上创建 Unix socket 文件并 listen。s.cfg.Socket 默认是 /var/run/my-cri.sock（见 @c:/project/mini-docker/pkg/cri/server.go:36），通过 CLI flag --socket 可改。
+net.Listen("unix", s.cfg.Socket) —— 在文件系统上创建 Unix socket 文件并 listen。s.cfg.Socket 默认是 /var/run/mydocker-cri.sock（见 @c:/project/mini-docker/pkg/cri/server.go:36），通过 CLI flag --socket 可改。
 Register* —— 往 s.grpc 的路由表写表项。
 s.grpc.Serve(lis) —— 让 gRPC server 在这个 listener 上跑起来：accept 连接、解析 HTTP/2 帧、按方法名路由到注册的 handler、阻塞返回。
 所以"两个服务在哪个端口"的答案是：
 
-没有端口，它们共用一个 Unix domain socket 文件：/var/run/my-cri.sock（或你用 --socket 配的路径）。
+没有端口，它们共用一个 Unix domain socket 文件：/var/run/mydocker-cri.sock（或你用 --socket 配的路径）。
 Unix socket 不是 TCP，没有端口号，就是文件系统里的一个特殊文件。两端通过文件路径"碰头"。
 
 #### (四)、Kubelet 怎么找到这个 socket
@@ -546,9 +546,9 @@ if err != nil {
     return fmt.Errorf("listen unix %s: %w", s.cfg.Socket, err)
 }
 ```
-net.Listen("unix", "/var/run/my-cri.sock") 内部最终调用了 Linux 的 socket(AF_UNIX, SOCK_STREAM, 0) + bind() 系统调用，让内核：
+net.Listen("unix", "/var/run/mydocker-cri.sock") 内部最终调用了 Linux 的 socket(AF_UNIX, SOCK_STREAM, 0) + bind() 系统调用，让内核：
 创建一个 socket 内核对象
-在文件系统的 /var/run/my-cri.sock 路径上落一个 socket 类型的 inode，关联到这个内核对象
+在文件系统的 /var/run/mydocker-cri.sock 路径上落一个 socket 类型的 inode，关联到这个内核对象
 所以关掉进程时这个文件不会自动消失，需要主动删——这就是为什么 Start() 第一步要清 stale socket：
 ```go
 // 清理之前的 socket 文件（daemon 被 kill 掉时不会自动删）
@@ -559,7 +559,7 @@ if err := os.Remove(s.cfg.Socket); err != nil && !os.IsNotExist(err) {
 ### 5. 客户端怎么连
 Client 端用同样的路径，比如 crictl / grpcurl / Kubelet 内部都是：
 ```go
-grpc.Dial("unix:///var/run/my-cri.sock", ...)  // 注意 unix:// 前缀
+grpc.Dial("unix:///var/run/mydocker-cri.sock", ...)  // 注意 unix:// 前缀
 unix:// 这个 scheme 告诉 gRPC："不要解析成主机名，把后面的路径当 socket 文件路径用"。
 ```
 .sock = 文件系统里的一个"socket 类型节点"，是同主机内进程间通信的入口，用文件路径代替 IP+端口寻址，安全（靠文件权限）、快速（不过网络栈）、本地专用。

@@ -23,12 +23,13 @@ const initPipeFD = 3
 
 // initPayload 是父进程通过 pipe 告诉子进程的启动参数。
 type initPayload struct {
-	Rootfs     string            `json:"rootfs"`
-	Hostname   string            `json:"hostname"`
-	WorkingDir string            `json:"working_dir,omitempty"`
-	Cmd        []string          `json:"cmd"`
-	Env        []string          `json:"env"`
-	JoinNS     map[string]string `json:"join_ns,omitempty"` // ns type -> /proc/<pid>/ns/<type>
+	Rootfs      string            `json:"rootfs"`
+	Hostname    string            `json:"hostname"`
+	WorkingDir  string            `json:"working_dir,omitempty"`
+	Cmd         []string          `json:"cmd"`
+	Env         []string          `json:"env"`
+	JoinNS      map[string]string `json:"join_ns,omitempty"` // ns type -> /proc/<pid>/ns/<type>
+	UnshareCgrp bool              `json:"unshare_cgrp,omitempty"`
 }
 
 func start(cfg Config) (*Handle, error) {
@@ -58,7 +59,14 @@ func start(cfg Config) (*Handle, error) {
 	defer r.Close()
 
 	// 计算 clone flags：如果某个 ns 要 join 已有的，就不创建新的
-	cloneFlags := cfg.Namespaces.CloneFlags()
+	//
+	// 注意 cgroup namespace 不在这里处理：clone(CLONE_NEWCGROUP) 会把 ns 的根
+	// 锁定为子进程**当前**所在的 cgroup（即父进程的，比如宿主的 user.slice），
+	// 但我们随后还会把子进程 AddProc 移到容器自己的 cgroup —— 子进程的
+	// /proc/self/cgroup 就会显示成 "/../../<容器节点>"。正确做法是先 AddProc，
+	// 等子进程进入容器 cgroup 之后再由它自己 unshare(CLONE_NEWCGROUP)，让 ns
+	// 根直接对齐到容器节点（输出干净的 "/"）。
+	cloneFlags := cfg.Namespaces.CloneFlags() &^ uintptr(syscall.CLONE_NEWCGROUP)
 	if cfg.JoinNS != nil {
 		for nsType := range cfg.JoinNS {
 			cloneFlags = clearCloneFlag(cloneFlags, nsType)
@@ -165,12 +173,13 @@ func start(cfg Config) (*Handle, error) {
 	}
 
 	payload := initPayload{
-		Rootfs:     cfg.Rootfs,
-		Hostname:   cfg.Hostname,
-		WorkingDir: cfg.WorkingDir,
-		Cmd:        cfg.Cmd,
-		Env:        cfg.Env,
-		JoinNS:     cfg.JoinNS,
+		Rootfs:      cfg.Rootfs,
+		Hostname:    cfg.Hostname,
+		WorkingDir:  cfg.WorkingDir,
+		Cmd:         cfg.Cmd,
+		Env:         cfg.Env,
+		JoinNS:      cfg.JoinNS,
+		UnshareCgrp: cfg.Namespaces.Cgroup, // child will unshare(CLONE_NEWCGROUP) only if requested
 	}
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		_ = cmd.Process.Kill()
@@ -239,6 +248,15 @@ func initProcess() error {
 	if len(payload.JoinNS) > 0 {
 		if err := joinNamespaces(payload.JoinNS); err != nil {
 			return fmt.Errorf("join namespaces: %w", err)
+		}
+	}
+
+	// 进入 cgroup namespace。必须在父进程完成 AddProc（把本进程移入容器自己的 cgroup）
+	// 之后才做：unshare(CLONE_NEWCGROUP) 会把 ns 的根固定为**当前**所在的 cgroup，
+	// 此时即容器节点本身，于是 /proc/self/cgroup 就显示成干净的 "/"。
+	if payload.UnshareCgrp {
+		if err := syscall.Unshare(syscall.CLONE_NEWCGROUP); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: unshare cgroup ns: %v (内核可能 < 4.6)\n", err)
 		}
 	}
 
@@ -326,6 +344,8 @@ func nsCloneFlag(ns string) int {
 		return syscall.CLONE_NEWPID
 	case "mnt":
 		return 0x00020000 // CLONE_NEWNS
+	case "cgroup":
+		return syscall.CLONE_NEWCGROUP
 	}
 	return 0
 }
@@ -343,6 +363,8 @@ func clearCloneFlag(flags uintptr, ns string) uintptr {
 		return flags &^ uintptr(syscall.CLONE_NEWPID)
 	case "mnt":
 		return flags &^ uintptr(syscall.CLONE_NEWNS)
+	case "cgroup":
+		return flags &^ uintptr(syscall.CLONE_NEWCGROUP)
 	}
 	return flags
 }

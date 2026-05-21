@@ -22,6 +22,9 @@ func (f Flags) CloneFlags() uintptr {
 	if f.IPC {
 		cf |= syscall.CLONE_NEWIPC
 	}
+	if f.Cgroup {
+		cf |= syscall.CLONE_NEWCGROUP
+	}
 	if f.User {
 		cf |= syscall.CLONE_NEWUSER
 	}

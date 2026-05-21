@@ -10,12 +10,12 @@
 #          不装时 Status 的 NetworkReady=false，沙箱启动不做网络分配，
 #          crictl 仍然能跑完所有其它流程。
 #
-# 运行后 /var/run/my-cri.sock 和 streaming :10350 会被创建；Ctrl-C 退出。
+# 运行后 /var/run/mydocker-cri.sock 和 streaming :10350 会被创建；Ctrl-C 退出。
 set -euo pipefail
 
 CRI_BIN="${CRI_BIN:-./bin/mydocker-cri}"
 MYDOCKER="${MYDOCKER:-./bin/mydocker}"
-SOCK="${SOCK:-/var/run/my-cri.sock}"
+SOCK="${SOCK:-/var/run/mydocker-cri.sock}"
 STREAM_ADDR="${STREAM_ADDR:-127.0.0.1:10350}"
 
 if [[ ! -x "$CRI_BIN" || ! -x "$MYDOCKER" ]]; then
@@ -116,7 +116,7 @@ if [[ -n "$CTR" ]]; then
     "${CRICTL[@]}" exec -s "$CTR" ls / || true
 
     # exec -it 需要用户交互，自动化脚本不跑；手动验证：
-    #   crictl --runtime-endpoint unix:///var/run/my-cri.sock exec -it "$CTR" /bin/sh
+    #   crictl --runtime-endpoint unix:///var/run/mydocker-cri.sock exec -it "$CTR" /bin/sh
 
     echo
     echo "== crictl stop =="

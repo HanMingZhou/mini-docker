@@ -215,6 +215,10 @@ curl --noproxy '*' http://192.168.105.2:8080      # macOS 宿主机直连 lima V
   <img src="docs/mydocker-nginx-web.png" alt="浏览器访问 mydocker 容器中的 nginx" width="800">
 </p>
 
+<p align="center">
+  <img src="docs/mydocker-cri.png" alt="cri:mydocker-cri" width="800">
+</p>
+
 ---
 
 ## Level 3：CRI gRPC Server

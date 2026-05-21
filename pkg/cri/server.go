@@ -33,7 +33,7 @@ const (
 	RuntimeName       = "mydocker"
 	RuntimeVersion    = "0.1.0"
 	RuntimeAPIVersion = "v1"
-	DefaultSocketPath = "/var/run/my-cri.sock"
+	DefaultSocketPath = "/var/run/mydocker-cri.sock"
 )
 
 // Config 是 CRI server 的启动配置。

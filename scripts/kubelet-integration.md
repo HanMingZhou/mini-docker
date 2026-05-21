@@ -62,7 +62,7 @@ After=network.target
 [Service]
 Type=exec
 ExecStart=/usr/local/bin/mydocker-cri serve \
-    --socket=/var/run/my-cri.sock \
+    --socket=/var/run/mydocker-cri.sock \
     --streaming-addr=127.0.0.1:10350 \
     --cni-conf-dir=/etc/cni/net.d \
     --cni-bin-dir=/opt/cni/bin
@@ -93,8 +93,8 @@ curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERS
 
 # 2. 配置 crictl 默认 endpoint
 sudo tee /etc/crictl.yaml >/dev/null <<'EOF'
-runtime-endpoint: unix:///var/run/my-cri.sock
-image-endpoint: unix:///var/run/my-cri.sock
+runtime-endpoint: unix:///var/run/mydocker-cri.sock
+image-endpoint: unix:///var/run/mydocker-cri.sock
 timeout: 10
 EOF
 
@@ -135,7 +135,7 @@ sudo apt-mark hold kubelet kubeadm kubectl
 sudo mkdir -p /etc/systemd/system/kubelet.service.d
 sudo tee /etc/systemd/system/kubelet.service.d/20-mydocker.conf >/dev/null <<'EOF'
 [Service]
-Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/my-cri.sock --image-service-endpoint=unix:///var/run/my-cri.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/mydocker-cri.sock --image-service-endpoint=unix:///var/run/mydocker-cri.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
 EOF
 sudo systemctl daemon-reload
 ```
@@ -144,7 +144,7 @@ sudo systemctl daemon-reload
 
 ```bash
 sudo kubeadm init \
-  --cri-socket=unix:///var/run/my-cri.sock \
+  --cri-socket=unix:///var/run/mydocker-cri.sock \
   --pod-network-cidr=10.22.0.0/16 \
   --kubernetes-version=v1.30.0
 
@@ -244,7 +244,7 @@ sudo ls /var/lib/mydocker/cni-cache/
 sudo kubeadm reset -f
 sudo systemctl stop kubelet mydocker-cri
 sudo rm -rf /var/lib/kubelet /etc/kubernetes /var/lib/mydocker /var/lib/cni
-sudo rm -f /etc/cni/net.d/10-mydocker.conflist /var/run/my-cri.sock
+sudo rm -f /etc/cni/net.d/10-mydocker.conflist /var/run/mydocker-cri.sock
 sudo ip link del mydocker0 2>/dev/null || true
 sudo iptables -t nat -F
 sudo iptables -F
