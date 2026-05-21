@@ -80,7 +80,6 @@ func (UnimplementedRuntimeServiceServer) RunPodSandbox(context.Context, *RunPodS
 ```
 
 这个 struct 自动满足 RuntimeServiceServer interface 的所有方法。
-
 关键技巧：Go 的"嵌入"（embedding）
 现在看本项目的代码：
 ```go
@@ -97,7 +96,6 @@ type RuntimeService struct {
 第一行 runtime.UnimplementedRuntimeServiceServer（没有字段名）是 Go 的结构体嵌入语法。它的效果是：
 RuntimeService 自动"继承"了 UnimplementedRuntimeServiceServer 的所有方法。
 所以一开始，RuntimeService 就已经满足了整个 RuntimeServiceServer interface——所有 RPC 都返回 Unimplemented 错误。
-
 然后你只需要写自己想支持的方法：
 ```go
 func (s *RuntimeService) Version(...) (...) { ... }  // 重写
@@ -145,13 +143,217 @@ type ImageService struct {
     root string // 数据根目录
 }
 ```
-七、一句话总结
+    
+### 三、一句话总结
 UnimplementedXxxServer 是 protoc 自动生成的"打底空壳"，通过 Go 的结构体嵌入让你的实现默认满足整个 interface；你只需要"挑你关心的 RPC 重写一下"，未来 cri-api 加新方法也不会破坏你的代码——这就是 gRPC Go 的前向兼容约定。
 
-题外话：这个模式在 gRPC Go 里是强烈推荐做法，新版本的 protoc-gen-go-grpc 甚至默认要求你必须嵌入它，否则编译会拒绝（require_unimplemented_servers=true）。
+题外话：这个模式在 gRPC Go 里是强烈推荐做法，新版本的 protoc-gen-go-grpc 甚至默认要求你必须嵌入它，否则编译会拒绝（require_unimplemented_servers=true）
 
 
-RuntimeService 的 RPC 大类
+
+### 四、Kubelet 是 client，mydocker-cri 是 server
+Kubelet 来找你，不是你去找 Kubelet
+
+理解了这个方向，剩下的疑问就全部消解了。下面把整条链路拆开讲。
+#### （一）CRI 是个 RPC 协议，谁是 server，谁是 client？
+┌─────────────┐    gRPC over Unix Socket    ┌──────────────────┐
+│   Kubelet   │ ──────── client ──────────► │   mydocker-cri   │
+│  (k8s 进程) │ ◄─────── response ──────── │   (你的进程)     │
+└─────────────┘                             └──────────────────┘
+                  /var/run/mydocker-cri.sock
+                  (server 监听这里)
+server：mydocker-cri 进程，监听 Unix socket，被动等连接
+client：Kubelet（也包括 crictl 这个调试工具），主动连过来发请求
+所以 mydocker-cri 根本不需要"知道 Kubelet 在哪里"——它只需要在一个约定好的 Unix socket 路径上监听，等别人来敲门。
+
+#### （二—）RegisterRuntimeServiceServer 到底做了什么
+```go
+runtime.RegisterRuntimeServiceServer(s.grpc, s.runtime)
+runtime.RegisterImageServiceServer(s.grpc, s.image)
+```
+这两行根本不涉及"连接"，更没有"端口"。它只是在进程内部做一件事：把方法实现注册到本地 gRPC server 的路由表里。
+
+可以把 gRPC server 想象成一个 HTTP web 框架（比如 Express、Gin）。"注册" 相当于：
+```go
+// 类比：HTTP framework
+app.post('/runtime.v1.RuntimeService/RunPodSandbox', s.runtime.RunPodSandbox)
+app.post('/runtime.v1.RuntimeService/CreateContainer', s.runtime.CreateContainer)
+app.post('/runtime.v1.ImageService/PullImage',         s.image.PullImage)
+// ...
+Register*ServiceServer 是 protoc 自动生成的纯本地函数，它做的事相当于这样（伪代码）：
+
+
+func RegisterRuntimeServiceServer(s *grpc.Server, srv RuntimeServiceServer) {
+    s.RegisterService(&_RuntimeService_serviceDesc, srv)
+}
+ 
+// _RuntimeService_serviceDesc 里写明了：
+//   service name = "runtime.v1.RuntimeService"
+//   methods = [
+//     {"Version",         srv.Version},
+//     {"RunPodSandbox",   srv.RunPodSandbox},
+//     {"CreateContainer", srv.CreateContainer},
+//     ...
+//   ]
+```
+注册完之后，gRPC server 内部维护的路由表大概长这样：
+```bash
+"/runtime.v1.RuntimeService/Version"          → s.runtime.Version
+"/runtime.v1.RuntimeService/RunPodSandbox"    → s.runtime.RunPodSandbox
+"/runtime.v1.RuntimeService/CreateContainer"  → s.runtime.CreateContainer
+... (RuntimeService 的 25+ 个 RPC)
+"/runtime.v1.ImageService/PullImage"          → s.image.PullImage
+"/runtime.v1.ImageService/ListImages"         → s.image.ListImages
+... (ImageService 的 5 个 RPC)
+```
+关键点：两个 service 都注册到同一个 s.grpc 实例（grpc.NewServer() 出来的那个对象），所以它们最终被同一个 socket 监听——s.cfg.Socket。
+
+#### (三)、那 socket 是怎么对上的
+往上几行看 Start()：
+```go
+func (s *Server) Start() error {
+    startReaper()
+ 
+    // 清理之前的 socket 文件（daemon 被 kill 掉时不会自动删）
+    if err := os.Remove(s.cfg.Socket); err != nil && !os.IsNotExist(err) {
+        return fmt.Errorf("remove stale socket %s: %w", s.cfg.Socket, err)
+    }
+    if err := os.MkdirAll(filepath.Dir(s.cfg.Socket), 0755); err != nil {
+        return fmt.Errorf("mkdir socket dir: %w", err)
+    }
+    lis, err := net.Listen("unix", s.cfg.Socket)
+    if err != nil {
+        return fmt.Errorf("listen unix %s: %w", s.cfg.Socket, err)
+    }
+    ...
+    runtime.RegisterRuntimeServiceServer(s.grpc, s.runtime)
+    runtime.RegisterImageServiceServer(s.grpc, s.image)
+ 
+    if err := s.grpc.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+        return err
+    }
+    return nil
+}
+```
+逻辑很直白：
+net.Listen("unix", s.cfg.Socket) —— 在文件系统上创建 Unix socket 文件并 listen。s.cfg.Socket 默认是 /var/run/my-cri.sock（见 @c:/project/mini-docker/pkg/cri/server.go:36），通过 CLI flag --socket 可改。
+Register* —— 往 s.grpc 的路由表写表项。
+s.grpc.Serve(lis) —— 让 gRPC server 在这个 listener 上跑起来：accept 连接、解析 HTTP/2 帧、按方法名路由到注册的 handler、阻塞返回。
+所以"两个服务在哪个端口"的答案是：
+
+没有端口，它们共用一个 Unix domain socket 文件：/var/run/my-cri.sock（或你用 --socket 配的路径）。
+Unix socket 不是 TCP，没有端口号，就是文件系统里的一个特殊文件。两端通过文件路径"碰头"。
+
+#### (四)、Kubelet 怎么找到这个 socket
+Kubelet 通过配置/启动参数知道 socket 路径，没有自动发现。
+部署时你做了这件事（README 里写得很清楚）：
+```bash
+sudo tee /etc/crictl.yaml >/dev/null <<'EOF'
+runtime-endpoint: unix:///var/run/mydocker-cri.sock
+image-endpoint: unix:///var/run/mydocker-cri.sock
+timeout: 10
+EOF
+ 
+sudo crictl info | head -20
+
+# 类似地，Kubelet 启动参数有：
+--container-runtime-endpoint=unix:///var/run/mydocker-cri.sock
+--image-service-endpoint=unix:///var/run/mydocker-cri.sock   # 较新版本默认与上一个相同
+```
+Kubelet 启动后会做：
+```go
+// 伪代码（kubelet 内部）
+runtimeConn, _ := grpc.Dial("unix:///var/run/mydocker-cri.sock", ...)
+runtimeClient := runtime.NewRuntimeServiceClient(runtimeConn)  // ← 这是 Register* 的对偶
+imageClient   := runtime.NewImageServiceClient(runtimeConn)
+// 然后调用：
+runtimeClient.Version(ctx, &VersionRequest{})
+runtimeClient.RunPodSandbox(ctx, &RunPodSandboxRequest{...})
+imageClient.PullImage(ctx, &PullImageRequest{...})
+```
+grpc.Dial("unix:///...") 就是 client 端"敲门"动作。Kubelet 进程成为这个 socket 的客户端，跟 mydocker-cri 建立长连接，后续所有 RPC 都通过这条连接。
+
+注意：Kubelet 用 NewRuntimeServiceClient 和 NewImageServiceClient 创建了两个 client 对象，但它们底层共用同一个 runtimeConn，因为 socket 是同一个。这就是"两个 service，一个连接"的来历。
+
+#### (五)、完整的"启动 + 第一个 RPC"时序
+                                   ┌─────────────────────────────────┐
+                                   │ /var/run/mydocker-cri.sock      │
+                                   └─────────────────────────────────┘
+                                                ▲   ▲
+1. systemctl start mydocker-cri                │   │
+   ──► main.go:newServeCmd                     │   │
+   ──► cri.New(Config{Socket: "/var/run/..."}) │   │
+   ──► Server.Start()                          │   │
+        ├─ os.Remove(socket)                   │   │
+        ├─ net.Listen("unix", socket) ────────►┘   │  (创建 socket 文件)
+        ├─ grpc.NewServer()                        │
+        ├─ RegisterRuntimeServiceServer(grpc, ...) │  (建路由表)
+        ├─ RegisterImageServiceServer(grpc, ...)   │
+        └─ grpc.Serve(lis) ─────── 阻塞 accept ───┘
+ 
+2. systemctl start kubelet
+   ──► kubelet 读启动参数 --container-runtime-endpoint=unix:///var/run/...
+   ──► grpc.Dial("unix:///var/run/mydocker-cri.sock") ───► 连接建立
+   ──► runtimeClient = NewRuntimeServiceClient(conn)
+   ──► imageClient   = NewImageServiceClient(conn)
+ 
+3. Kubelet 做心跳
+   ──► runtimeClient.Version(ctx, &VersionRequest{})
+       │
+       │ 在 wire 上发送 HTTP/2 frame：
+       │   :method = POST
+       │   :path   = /runtime.v1.RuntimeService/Version
+       │   body    = protobuf(VersionRequest)
+       ▼
+   mydocker-cri 收到帧：
+       ──► 按 :path 在路由表查找
+       ──► 命中 s.runtime.Version
+       ──► 调 loggingInterceptor → s.runtime.Version(ctx, req)
+       ──► 返回 VersionResponse
+       ──► 序列化成 protobuf 发回
+   ▲
+   └── Kubelet 收到响应
+#### (六)、回到你的原问题
+"RegisterRuntimeServiceServer(s.grpc, s.runtime) 是怎么知道 kubelet 的 runtime、image 这两个服务的端口呢？"
+
+校正之后的答案：
+Register 只是把方法注册到本地路由表
+两个 service 共用一个 Unix socket 文件，没有端口
+Kubelet 主动找 mydocker-cri（Kubelet 是 client）
+Kubelet 通过启动参数 --container-runtime-endpoint 知道 socket 路径
+两端"对上"靠的是共同约定的 Unix socket 路径，不是端口、不是注册中心、不是广播——就是文件系统里那个 .sock 文件。
+
+#### (七)、一些可能让你更踏实的实验
+如果你想亲眼看见这件事，在 Linux 上可以做：
+```bash
+# 1. 看 mydocker-cri 监听的 socket 文件
+sudo ls -l /var/run/mydocker-cri.sock
+# srw-rw---- 1 root root 0 ... /var/run/mydocker-cri.sock
+#  ↑ 's' 表示这是 socket
+ 
+# 2. 看哪个进程在监听
+sudo ss -lxp | grep mydocker-cri
+# u_str LISTEN ... users:(("mydocker-cri",pid=12345,fd=7))
+ 
+# 3. 看 kubelet 作为 client 连进来
+sudo ss -xp | grep mydocker-cri
+# u_str ESTAB ... users:(("kubelet",pid=...,fd=...))
+#                 ↑ kubelet 是 client，建立了连接
+ 
+# 4. 用 grpcurl 自己当 client，列出所有方法
+sudo grpcurl -unix /var/run/mydocker-cri.sock list
+# runtime.v1.ImageService
+# runtime.v1.RuntimeService
+sudo grpcurl -unix /var/run/mydocker-cri.sock list runtime.v1.RuntimeService
+# runtime.v1.RuntimeService.Version
+# runtime.v1.RuntimeService.RunPodSandbox
+# ...
+```
+第 4 步特别有意思——这两个 service 名字 runtime.v1.RuntimeService 和 runtime.v1.ImageService 就是 Register*ServiceServer 写进路由表的 key，是 proto 文件里 package runtime.v1; service RuntimeService { ... } 自动生成的。任何 client（Kubelet、crictl、grpcurl）只要能访问这个 socket、知道这个名字，就能调。
+
+
+
+## 三、RuntimeService 的 RPC 大类
 类别	    典型 RPC	        本项目位置
 握手/心跳	Version、Status	        server.go:261-286
 Pod 沙箱	RunPodSandbox / StopPodSandbox / RemovePodSandbox / PodSandboxStatus / ListPodSandbox   sandbox.go
@@ -159,7 +361,7 @@ Pod 沙箱	RunPodSandbox / StopPodSandbox / RemovePodSandbox / PodSandboxStatus 
 执行	ExecSync / Exec / Attach / PortForward	exec.go
 统计与配置	ContainerStats / ListContainerStats / PodSandboxStats / UpdateRuntimeConfig / UpdateContainerResources / ReopenContainerLog     stats.go
 
-### 关键概念：什么是 Pod 沙箱？
+## 关键概念：什么是 Pod 沙箱
 CRI 把"Pod"分成两层：
 Sandbox（沙箱）：先创建的"壳"，持有 Pod 级的 网络命名空间、IPC 命名空间、cgroup 父目录、Pod IP，本身通常只跑一个轻量 pause 进程，永不退出。
 Container（容器）：在沙箱之上，加入沙箱的 network/IPC/UTS 命名空间，但有自己的 PID/Mount 命名空间和镜像 rootfs。
@@ -282,235 +484,85 @@ image-endpoint:   unix:///var/run/mydocker-cri.sock
 用 stargz-snapshotter 作为独立 image 服务做懒加载
 这就是上一轮回答里"协议允许但通常不这么用"的具体含义。
 
-## 六、记忆口诀
+记忆口诀
 RuntimeService = "动的东西"：Pod、容器、进程、Exec、Stats
 ImageService = "静的东西"：镜像文件、磁盘占用
 两者通过 CRI 协议统一接口，通过 共享数据目录解耦实现
 
 
 
+## 六、sock 是什么
+.sock 文件是 Unix Domain Socket（Unix 域套接字），俗称 "Unix socket"。
+它是操作系统提供的一种进程间通信（IPC）机制，跟 TCP/UDP 是同一级别的概念，但用法和性质完全不同。
 
+### 1. 直观对比 TCP socket
+维度	    TCP socket	    Unix domain socket
+寻址方式	IP + 端口 (127.0.0.1:10250)	              文件系统路径 (/var/run/foo.sock)
+协议栈	    走 TCP/IP，要经过网卡驱动、IP 层、TCP 层	直接在内核内存里拷贝，不走网络栈
+跨主机	    可以	                                  不可以，只能同一台机器
+性能	    较慢	                                  快几倍（无 checksum、无路由查找）
+权限控制	靠防火墙	                               靠文件系统权限（chmod / chown）
+在 ss/netstat 里	TCP 列表	                      Unix 列表（ss -lx）
+.sock 的 .sock 后缀只是约定俗成的命名习惯，不是必须的——内核根本不看后缀。
+叫 foo.sock、bar.unix、baz 都行，只要双方约定好路径。
+Docker 用 /var/run/docker.sock、
+containerd 用 /run/containerd/containerd.sock、
+systemd 用 /run/systemd/notify，都是同样的东西。
 
+### 2. 在文件系统里长什么样
+```bash
+$ ls -l /var/run/mydocker-cri.sock
+srw-rw---- 1 root root 0 Nov 20 10:00 /var/run/mydocker-cri.sock
+^
+└── 第一个字符是 's'，表示这是 socket 文件
+   - 普通文件: '-'
+   - 目录:    'd'
+   - 软链接:  'l'
+   - 块设备:  'b'
+   - 字符设备:'c'
+   - 管道:    'p'
+   - socket:  's'  ← 这就是
+```
+它不是普通文件，里面没数据，size 永远 0。cat foo.sock 会卡住或报错。它只是文件系统里的一个"特殊节点"，作为内核里那个 socket 对象的"门牌号"。
 
-
-共享 namespace 的实现机制
-要回答这个问题，需要理解三个 Linux 内核概念，然后看 mini-docker 在哪一行调用了对应的系统调用。
-
-一、Linux 内核里"namespace"是什么
-每个进程在内核里都有一组指针，指向 7 类 namespace 对象：
-
-进程 PCB (task_struct)
-  └── nsproxy
-       ├── mnt_ns   (文件系统挂载视图)
-       ├── pid_ns   (进程号视图)
-       ├── net_ns   (网卡/路由/iptables/端口)
-       ├── uts_ns   (hostname/domainname)
-       ├── ipc_ns   (SysV IPC、POSIX 消息队列)
-       ├── user_ns  (uid/gid 映射)
-       └── cgroup_ns
-两个进程指针指向同一个 namespace 对象 ⇒ 它们看到同一份资源，反之看到不同的副本。
-
-每个 namespace 对象在 /proc 里被表示为一个文件：
-
-/proc/<PID>/ns/net  → 一个 inode，代表"net namespace 实例 X"
-/proc/<PID>/ns/ipc  → ...
-/proc/<PID>/ns/uts  → ...
-/proc/<PID>/ns/pid  → ...
-/proc/<PID>/ns/mnt  → ...
-如果两个进程的 /proc/<pid>/ns/net 指向同一个 inode，它们就在同一个 net namespace 里。
-
-bash
-# 验证：同一个 Pod 里两个容器
-$ ls -L /proc/12345/ns/net   # 容器 A
-net:[4026532001]
-$ ls -L /proc/12346/ns/net   # 容器 B
-net:[4026532001]   # ← 数字相同！
-二、Pod 沙箱的角色
-回想 sandbox 是怎么创建的（@c:/project/mini-docker/pkg/sandbox/sandbox.go:1-7）：
-
-沙箱 = 一个常驻的 pause 进程 + 独立的 network/UTS/IPC namespace。
-
-启动 sandbox 时用 clone(2) 系统调用，传入 CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS，内核会新建三个 namespace 对象，把 pause 进程指过去。pause 进程一直 sleep 不退出，namespace 对象的引用计数就永远 ≥ 1，不会被销毁。
-
-之后 sandbox 把 pause 的 PID 记下来：
-
-sandbox.go:46-50
-Metadata     Metadata          `json:"metadata"`
-State        State             `json:"state"`
-PID          int               `json:"pid"`          // pause 进程的宿主机 PID
-NetnsPath    string            `json:"netns_path"`   // /proc/<pid>/ns/net，便于业务容器 setns
-IP           string            `json:"ip,omitempty"` // CNI 分配的 IPv4，无则空
-/proc/<sb.PID>/ns/net 这个文件路径就成了"指向沙箱 net namespace 的句柄"。
-
-三、StartContainer 怎么让容器进去
-回到你看的代码（@c:/project/mini-docker/pkg/cri/container.go:233-264），有两步关键动作：
-
-第 1 步：告诉内核 clone 时不要新建这三个 ns
-在父进程（mydocker-cri）里：
-
-go
-joinNS := map[string]string{
-    "net": fmt.Sprintf("/proc/%d/ns/net", sb.PID),
-    "ipc": fmt.Sprintf("/proc/%d/ns/ipc", sb.PID),
-    "uts": fmt.Sprintf("/proc/%d/ns/uts", sb.PID),
+### 3. 为什么 CRI 选 Unix socket 而不是 TCP
+mydocker-cri 完全可以监听 127.0.0.1:10350，但 CRI 标准选了 Unix socket 有几个原因：
+安全：Unix socket 用文件权限控制访问。chmod 0660 + chown root:root 就能确保只有 root（也就是 Kubelet）能调用，不需要担心 TCP 端口被外部扫到。
+```go
+// Kubelet 是 root，但我们仍设置 0660 便于本机调试（crictl 通常用 root）
+if err := os.Chmod(s.cfg.Socket, 0660); err != nil {
+    _ = lis.Close()
+    return fmt.Errorf("chmod socket: %w", err)
 }
-...
-Namespaces: namespace.Flags{
-    PID:     true,
-    Mount:   true,
-    Network: true, // will be cleared by JoinNS
-    IPC:     true, // will be cleared by JoinNS
-    UTS:     true, // will be cleared by JoinNS
-},
-注释 "will be cleared by JoinNS" 是核心机关。来看实现：
-
-container_linux.go:60-71
-// 计算 clone flags：如果某个 ns 要 join 已有的，就不创建新的
-cloneFlags := cfg.Namespaces.CloneFlags()
-if cfg.JoinNS != nil {
-    for nsType := range cfg.JoinNS {
-        cloneFlags = clearCloneFlag(cloneFlags, nsType)
-    }
+```
+本机通信场景明确：CRI 协议里有传文件描述符（fd 传递）、流式 stdio（Exec/Attach）这种需求，TCP 做起来麻烦，Unix socket 原生支持 SCM_RIGHTS 传 fd。
+性能：Kubelet 每秒可能调几十次 Status / List，绕开 TCP 协议栈能省 CPU。
+避免端口冲突：用一个文件路径，不用全局协调端口号。
+### 4. 在代码里它是怎么"出现"的
+这一行就是 socket 文件诞生的地方：
+```go
+lis, err := net.Listen("unix", s.cfg.Socket)
+if err != nil {
+    return fmt.Errorf("listen unix %s: %w", s.cfg.Socket, err)
 }
- 
-cmd := exec.Command(initBinary(cfg), "init")
-cmd.SysProcAttr = &syscall.SysProcAttr{
-    Cloneflags: cloneFlags,
+```
+net.Listen("unix", "/var/run/my-cri.sock") 内部最终调用了 Linux 的 socket(AF_UNIX, SOCK_STREAM, 0) + bind() 系统调用，让内核：
+创建一个 socket 内核对象
+在文件系统的 /var/run/my-cri.sock 路径上落一个 socket 类型的 inode，关联到这个内核对象
+所以关掉进程时这个文件不会自动消失，需要主动删——这就是为什么 Start() 第一步要清 stale socket：
+```go
+// 清理之前的 socket 文件（daemon 被 kill 掉时不会自动删）
+if err := os.Remove(s.cfg.Socket); err != nil && !os.IsNotExist(err) {
+    return fmt.Errorf("remove stale socket %s: %w", s.cfg.Socket, err)
 }
-Cloneflags 是 Go 标准库对 Linux clone(2) 的封装。clearCloneFlag 用 Go 的位运算 &^（AND-NOT）把对应 bit 清零：
+```
+### 5. 客户端怎么连
+Client 端用同样的路径，比如 crictl / grpcurl / Kubelet 内部都是：
+```go
+grpc.Dial("unix:///var/run/my-cri.sock", ...)  // 注意 unix:// 前缀
+unix:// 这个 scheme 告诉 gRPC："不要解析成主机名，把后面的路径当 socket 文件路径用"。
+```
+.sock = 文件系统里的一个"socket 类型节点"，是同主机内进程间通信的入口，用文件路径代替 IP+端口寻址，安全（靠文件权限）、快速（不过网络栈）、本地专用。
 
-container_linux.go:333-348
-func clearCloneFlag(flags uintptr, ns string) uintptr {
-    switch ns {
-    case "net":
-        return flags &^ uintptr(syscall.CLONE_NEWNET)
-    case "ipc":
-        return flags &^ uintptr(syscall.CLONE_NEWIPC)
-    case "uts":
-        return flags &^ uintptr(syscall.CLONE_NEWUTS)
-结果：exec.Command(...).Start() 实际触发的 clone 调用，flags 只包含 CLONE_NEWPID | CLONE_NEWNS，没有 CLONE_NEWNET / IPC / UTS。
 
-内核看到这组 flag 后：
 
-给新进程新建 PID 和 mount namespace（独立进程视图、独立文件系统视图）
-复制父进程指针给 net/ipc/uts namespace（也就是 mydocker-cri 自己的，还不是 sandbox 的）
-所以这一步只是"先不要新建"，还没真的进 sandbox 的 namespace。
-
-第 2 步：子进程启动后用 setns(2) 主动加入
-子进程（init 进程）启动后立刻调用 initProcess：
-
-container_linux.go:238-243
-// 加入已有 namespace（CRI 场景：加入沙箱的 netns/ipc/uts）
-if len(payload.JoinNS) > 0 {
-    if err := joinNamespaces(payload.JoinNS); err != nil {
-        return fmt.Errorf("join namespaces: %w", err)
-    }
-}
-joinNamespaces 是真正干活的地方：
-
-container_linux.go:295-315
-// joinNamespaces 使用 setns 加入指定的 namespace。
-func joinNamespaces(nsMap map[string]string) error {
-    // 顺序：net, ipc, uts（pid 不在这里处理，mount 也不——我们自己做 pivot_root）
-    order := []string{"net", "ipc", "uts"}
-    for _, ns := range order {
-        path, ok := nsMap[ns]
-        if !ok {
-            continue
-        }
-        fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
-        if err != nil {
-            return fmt.Errorf("open %s (%s): %w", ns, path, err)
-        }
-        if err := unix.Setns(fd, nsCloneFlag(ns)); err != nil {
-            _ = unix.Close(fd)
-            return fmt.Errorf("setns %s: %w", ns, err)
-        }
-        _ = unix.Close(fd)
-    }
-    return nil
-}
-逐行翻译：
-
-unix.Open("/proc/<sb.PID>/ns/net", O_RDONLY) —— 打开 sandbox 那个 net namespace 文件，拿到一个 fd。
-unix.Setns(fd, CLONE_NEWNET) —— 核心系统调用。告诉内核："把当前进程的 net namespace 指针，改为这个 fd 所代表的那一个"。
-ipc、uts 同理。
-setns(2) 之后，子进程的内核 task_struct 里：
-
-nsproxy.net_ns 指向 sandbox 的 net_ns ✅
-nsproxy.ipc_ns 指向 sandbox 的 ipc_ns ✅
-nsproxy.uts_ns 指向 sandbox 的 uts_ns ✅
-nsproxy.pid_ns 是 clone 时新建的（独立进程视图） ✅
-nsproxy.mnt_ns 是 clone 时新建的（独立文件系统视图） ✅
-正好对应你的描述：共享 net/ipc/uts，独立 pid/mount。
-
-第 3 步：pivot_root + execve
-container_linux.go:251-289
-// pivot_root + /proc /sys /dev（extraMounts 已在父进程预挂到 merged）
-if err := rootfs.Setup(payload.Rootfs, nil); err != nil {
-    return fmt.Errorf("rootfs setup: %w", err)
-}
-...
-if err := syscall.Exec(bin, payload.Cmd, envSlice); err != nil {
-在自己独立的 mount namespace 里 pivot_root，把根目录换成镜像 rootfs；最后 execve 替换成业务进程（nginx / sh / 你的应用）。
-
-四、串起来：一次 StartContainer 的完整时序
-mydocker-cri (父)                 init 子进程                     业务进程
-─────────────────────────────────────────────────────────────────────────
-1. exec.Command(init, "init")
-   Cloneflags = CLONE_NEWPID|NS
-                 (NET/IPC/UTS 已被 clear)
-2. cmd.Start()
-   ───── clone(2) ─────────────►   诞生
-                                   nsproxy 状态：
-                                   - pid_ns: 新建 ✅
-                                   - mnt_ns: 新建 ✅
-                                   - net_ns: 继承父（cri）❌
-                                   - ipc_ns: 继承父（cri）❌
-                                   - uts_ns: 继承父（cri）❌
-3. 父写 JSON payload(JoinNS)
-   到 pipe ─────────────────────► 读到 payload
- 
-                                4. for ns in [net, ipc, uts]:
-                                     fd = open(/proc/<sb.PID>/ns/<ns>)
-                                     setns(fd, CLONE_NEW<NS>)
-                                   nsproxy 状态：
-                                   - net_ns: → sandbox ✅
-                                   - ipc_ns: → sandbox ✅
-                                   - uts_ns: → sandbox ✅
- 
-                                5. pivot_root(rootfs)
-                                   挂 /proc /sys /dev（独立 mnt_ns 里）
- 
-                                6. execve(/usr/bin/nginx, ...) ──► nginx
-                                   ↑ 内存映像被替换，但 nsproxy 不变
-最后业务进程（nginx）继承了 init 设置好的所有 namespace 指针。
-
-五、可观测的效果
-假设同一个 Pod 里跑两个容器 A（nginx）和 B（curl-sidecar），它们的 pause 进程 PID 是 1000，nginx 是 1001，curl 是 1002：
-
-验证	命令	预期
-共享 netns	ls -L /proc/{1000,1001,1002}/ns/net	三个 inode 数字相同
-共享 utsns	ls -L /proc/{1000,1001,1002}/ns/uts	三个 inode 数字相同
-独立 pidns	ls -L /proc/{1001,1002}/ns/pid	nginx 与 curl 不同
-独立 mntns	ls -L /proc/{1001,1002}/ns/mnt	nginx 与 curl 不同
-localhost 互通	在 curl 容器里 curl 127.0.0.1:80	命中 nginx
-独立 ps	nginx 容器里 ps、curl 容器里 ps	各自只看到自己的进程
-独立 rootfs	nginx 容器里 ls / 是 nginx 镜像，curl 容器里是 curl 镜像	互不可见
-localhost 互通的内核解释：因为指向同一个 net_ns，意味着同一份网卡列表（同一个 lo）、同一个路由表、同一个 TCP 连接表、同一段 IP（Pod IP）。nginx 把 80 端口绑到 0.0.0.0 时，curl 容器一发 127.0.0.1:80，内核在共享的 lo 设备上把包送给同一个 net_ns 里监听的 socket——也就是 nginx。
-
-六、几个容易被忽略的细节
-1. clone vs setns 为什么要分开？
-理论上完全可以全用 setns，但 mount namespace 必须早进入（pivot_root 依赖独立的 mnt_ns），而 setns(CLONE_NEWNS) 在 Go 多线程运行时里有大坑（见 pkg/nsenter 的 unshare CLONE_FS 注释）。所以本项目策略是：能在 clone 时新建的就 clone 时建，需要"加入已有"的就 setns。
-
-2. 为什么不 join PID namespace？
-K8s 默认 Pod 内多容器不共享 PID namespace（避免一个容器看到别人的进程）。PID: true 会让每个容器有自己的 init=1 进程视图。如果 Pod spec 里设置 shareProcessNamespace: true，CRI 层应该把 pid 也加进 joinNS——本项目目前没实现这块。
-
-3. 为什么不 join mount namespace？
-Mount namespace 必须和镜像 rootfs绑定。每个容器跑不同的镜像，pivot_root 必须在自己独立的 mnt_ns 里做，否则会污染其它容器看到的文件系统。
-
-4. CNI 网络是怎么和 sandbox 的 netns 关联的？
-CNI 在 RunPodSandbox 阶段调用，作用对象就是 /proc/<pause-pid>/ns/net：CNI 插件在那个 netns 里建 veth pair、配 IP、加路由。等 StartContainer 让业务容器 setns 进同一个 netns 时，网络已经布好了，容器一启动就能直接用 Pod IP 通信。
-
-一句话本质
-"共享 namespace" = 多个进程的内核 nsproxy 指针指向同一个 namespace 对象。 mini-docker 的实现 = clone() 时不要新建（清掉 CLONE_NEW* 位）+ 子进程启动后用 setns(open("/proc/<sb.PID>/ns/<ns>")) 主动加入沙箱的 namespace。

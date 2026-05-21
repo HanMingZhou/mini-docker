@@ -942,3 +942,260 @@ K8s 必须由 Kubelet 决定：
 Kubelet 把所有 Pod 组织成 kubepods/<QoS>/pod<uid> 这样的层级，CRI 实现必须照办，否则 Kubelet 没法做总体资源核算（节点级 reservation、QoS 强制）。
 cgroup driver 必须和 Kubelet 一致，否则 systemd 和 cgroupfs 各写一份就乱套了（这是 K8s 排查频率最高的坑之一，你的 scripts/kubelet-integration.md 里也提到了）。
 所以这两个字段在 container.Config 里存在，是为 CRI 服务的；CLI 模式下它们是"没用但要留着"的占位。
+
+
+
+
+
+
+cgroup 树是什么
+cgroup 在内核里就是一棵树——不是比喻，而是字面意义上的树形结构。它直接以目录树的形式暴露在 /sys/fs/cgroup/ 下，目录就是树的节点。
+
+一、最直观：去看一眼
+在你 Linux 机器上敲：
+
+bash
+$ ls /sys/fs/cgroup/
+cgroup.controllers   cgroup.procs       cpu.stat         memory.stat
+cgroup.max.depth     cgroup.subtree_control   ...
+init.scope/          system.slice/      user.slice/
+每个子目录就是一个 cgroup（节点）。子目录里又能有子目录，形成递归结构：
+
+bash
+$ tree -L 3 /sys/fs/cgroup/
+/sys/fs/cgroup/                              ← 根 cgroup
+├── system.slice/                            ← systemd 系统服务都挂这下面
+│   ├── docker.service/
+│   ├── nginx.service/
+│   ├── kubelet.service/
+│   └── ssh.service/
+├── user.slice/                              ← 用户登录会话挂这下面
+│   └── user-1000.slice/
+│       └── session-3.scope/
+├── kubepods.slice/                          ← K8s Pod 都挂这下面
+│   ├── kubepods-besteffort.slice/
+│   ├── kubepods-burstable.slice/
+│   │   └── kubepods-burstable-pod_abc123.slice/   ← 一个 Pod
+│   │       ├── cri-containerd-xxx.scope/          ← 容器 1
+│   │       └── cri-containerd-yyy.scope/          ← 容器 2
+│   └── kubepods-guaranteed.slice/
+└── init.scope/                              ← systemd PID 1 自己
+这就是 cgroup 树。/sys/fs/cgroup/ 是根，每往下一层目录就是树里的一个子节点。
+
+二、每个节点里有什么？
+随便进一个目录看：
+
+bash
+$ ls /sys/fs/cgroup/system.slice/nginx.service/
+cgroup.controllers       cpu.max          memory.current
+cgroup.events            cpu.stat         memory.max
+cgroup.freeze            cpu.weight       memory.peak
+cgroup.procs             io.max           memory.stat
+cgroup.subtree_control   io.stat          pids.current
+cgroup.threads           memory.events    pids.max
+一个 cgroup 节点里有两类文件：
+
+1. 配置文件（你写它，设置限制）
+
+bash
+$ echo $((100*1024*1024)) > memory.max     # 限内存 100MB
+$ echo "50000 100000" > cpu.max            # 限 CPU 50%
+2. 状态文件（你读它，看当前情况）
+
+bash
+$ cat memory.current      # 当前用了多少内存
+$ cat cpu.stat            # CPU 累计用量
+$ cat cgroup.procs        # 哪些 PID 在这个 cgroup 里
+三、树形结构的意义：限制会向下传递
+cgroup 是树不是平铺，是因为限制要继承。比如：
+
+/sys/fs/cgroup/kubepods.slice/                memory.max = 8GB    ← K8s 总共 8GB
+└── kubepods-burstable.slice/                  memory.max = 6GB   ← burstable 类 6GB
+    └── kubepods-burstable-pod_abc.slice/      memory.max = 1GB   ← 这个 Pod 1GB
+        └── cri-containerd-xxx.scope/          memory.max = 512M  ← 容器 512MB
+子节点的限制只能比父节点更严：容器最多 512MB，是因为它在 1GB 的 Pod 节点下，又在 6GB 的 burstable 节点下。任何祖先满了，整个子树都要让步——所以 K8s 用这个层级实现 QoS 调度（Guaranteed > Burstable > BestEffort）。
+
+进程跑起来后只能属于树上的一个节点（cgroup v2 单一层级），那个节点和它所有祖先的限制都对它生效。
+
+四、为什么叫"树"？因为它就是一棵树
+抽象地画出来：
+
+                 根 (/sys/fs/cgroup)
+                /        |          \
+       system.slice  user.slice   kubepods.slice
+       /     |               \         |
+docker     nginx            ssh    burstable.slice
+.service   .service         .service     |
+                                       pod_abc.slice
+                                       /         \
+                               container-1     container-2
+根 = /sys/fs/cgroup/
+节点 = 每个子目录
+叶子 = 通常是真正跑进程的那一层（service / scope）
+进程 = 挂在某个叶子节点的 cgroup.procs 文件里
+这棵树由谁建？主要是 systemd（系统服务、用户会话）和 容器运行时（containerd / mydocker-cri）创建相应子树。本项目对应的代码：
+
+container_linux.go:121-145
+// 创建 cgroup（写文件，比如 /sys/fs/cgroup/mydocker/<name>/）
+cg, err := cgroup.NewWithConfig(cgroup.Config{
+    Name:   cgName,
+    Parent: cfg.CgroupParent,
+    Driver: cfg.CgroupDriver,
+})
+这一段就是"在 cgroup 树上创建一个新节点"——本质就是 mkdir /sys/fs/cgroup/<parent>/<name>/，加上往里面写几个限制文件。Parent 就是这个新节点要挂在树的哪个父节点下。
+
+五、连回 /proc/self/cgroup
+回想上一题：
+
+bash
+$ cat /proc/self/cgroup
+0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod_abc.slice/cri-containerd-xxx.scope
+   ↑
+   这就是这棵树里"我所在节点"的路径
+它是绝对路径，从树根开始一路写下来——和文件系统里 pwd 给你的路径完全一样的概念，只不过描述的是 cgroup 树而不是文件树。
+
+cgroup namespace 把这个路径"裁掉前缀"，让容器只看到它在自己子树根之后的部分（通常是 /），实现"假装自己在树根"的效果。
+
+六、和文件系统树类比
+概念	文件系统	cgroup
+树根	/	/sys/fs/cgroup/
+节点	目录	子目录（每个就是一个 cgroup）
+创建节点	mkdir foo	mkdir /sys/fs/cgroup/foo/（自动变成新 cgroup）
+进程在哪	chdir（每个进程一个 cwd）	cgroup.procs 文件里写 PID
+删节点	rmdir foo	rmdir /sys/fs/cgroup/foo/（前提是空的）
+可以完全用普通的目录操作来管理 cgroup 树——这是 Linux "everything is a file" 的体现。
+
+一句话本质
+cgroup 树 = /sys/fs/cgroup/ 下的目录树，每个目录是一个 cgroup 节点，节点里的文件是限制规则和用量；进程被挂在树的某个叶子节点上，受这个节点和所有祖先节点的资源限制叠加约束。systemd 和容器运行时通过 mkdir 这棵树来组织系统资源。
+
+cgroup 树 vs "容器隔离的 cgroup" —— 是同一个东西
+这俩不是两个概念，是一个东西的两面：
+
+cgroup 树 = 这个机制的结构形态（一棵目录树）
+容器隔离的 cgroup = 这个机制的用途之一（用它给容器做资源限制）
+就好比：
+
+"户籍系统" 是一棵树（国 → 省 → 市 → 区 → 户）
+"给某户人家限电" 是户籍系统的一个用途
+不是两个系统，是一个系统的不同切面。
+
+一、把它们的关系画出来
+         ┌─────────────────────────────┐
+         │       Linux cgroup 子系统    │
+         │  （内核的资源管控引擎）        │
+         └──────────────┬──────────────┘
+                        │ 通过虚拟文件系统暴露
+                        ▼
+         ┌─────────────────────────────┐
+         │  /sys/fs/cgroup/  ← cgroup 树│
+         │     /                        │
+         │     ├── system.slice/        │
+         │     ├── user.slice/          │
+         │     └── kubepods.slice/      │  ← 这就是 cgroup 树
+         │         └── pod_abc/         │
+         │             └── nginx/       │     每个目录 = 一个节点
+         │                 ├─ memory.max│     节点里的文件 = 限制规则
+         │                 ├─ cpu.max   │
+         │                 └─ cgroup.procs ← 进程在这里登记
+         └─────────────────────────────┘
+                        │
+       ┌────────────────┼─────────────────┐
+       ▼                ▼                 ▼
+给 systemd 服务      给容器隔离          给用户会话
+限资源              限资源              限资源
+（nginx.service）   （docker-xxx）      （user-1000）
+                         ▲
+                         │
+                 这个就是"容器隔离的 cgroup"
+                 ——它只是 cgroup 树上**长出来的一根树枝**
+二、"容器隔离" 在树上长什么样
+容器运行时（Docker / containerd / mydocker-cri）启动一个容器时，做的事情就是：
+
+在 cgroup 树某个父节点下 mkdir 一个新子目录（= 长出一片新叶子）
+往这个新目录里写限制文件（memory.max = 100MB 等）
+把容器进程的 PID 写进 cgroup.procs（= 进程登记到这片叶子上）
+举例：
+
+启动一个 K8s nginx 容器之前：
+ 
+/sys/fs/cgroup/
+└── kubepods.slice/
+    └── pod_abc.slice/
+         (空)
+ 
+ 
+启动后：
+ 
+/sys/fs/cgroup/
+└── kubepods.slice/
+    └── pod_abc.slice/
+        └── cri-containerd-nginx-xxx.scope/    ← 新长出来的叶子
+            ├── memory.max = 104857600         ← 限 100MB
+            ├── cpu.max   = "50000 100000"     ← 限 50% CPU
+            └── cgroup.procs                   ← 里面写着 nginx 进程的 PID
+这就是"容器隔离的 cgroup"——它不是一棵新树，只是 cgroup 树上的一个节点。
+
+本项目里这件事就发生在：
+
+container_linux.go:121-145
+// 创建 cgroup（写文件，比如 /sys/fs/cgroup/mydocker/<name>/）
+cg, err := cgroup.NewWithConfig(cgroup.Config{
+    Name:   cgName,
+    Parent: cfg.CgroupParent,    ← 挂在树的哪个父节点下
+    Driver: cfg.CgroupDriver,
+})
+...
+// Apply 写资源限制（内存上限、CPU 配额）
+if err := cg.Apply(cfg.Resources); err != nil {
+...
+// AddProc 把子进程 PID 写进 cgroup.procs 文件
+if err := cg.AddProc(cmd.Process.Pid); err != nil {
+三步：mkdir 新节点 → 写限制文件 → 把 PID 登记进去。这就是"容器隔离的 cgroup"的全部实现。
+
+三、为什么需要"树"而不是平铺？
+如果不是树，每个容器各自一个独立的 cgroup，会出现两个问题：
+
+问题 1：没法做"组上限"
+K8s 想说"所有 BestEffort 类的 Pod 加起来不能超过 4GB"——平铺结构做不到。但有树之后：
+
+/sys/fs/cgroup/
+└── kubepods.slice/                     memory.max = 8GB
+    ├── kubepods-besteffort.slice/      memory.max = 4GB   ← 给一整类设上限
+    │   ├── pod_a/container/   100MB
+    │   ├── pod_b/container/   200MB
+    │   └── pod_c/container/   ...
+    └── kubepods-burstable.slice/       memory.max = 6GB
+        └── ...
+besteffort 这一整个子树加起来不能超 4GB。一个 Pod 占多了，同类其他 Pod 就没空间——这是 K8s QoS 优先级的内核基础。
+
+问题 2：没法做"父子继承"
+容器在 Pod 节点下、Pod 在 QoS 节点下、QoS 在 K8s 总节点下——任何祖先满了，整片子树都受影响。这种"层层施压"只有树状结构能表达。
+
+四、把"容器隔离的 cgroup" 重新定义清楚
+回到你之前那张三件套表：
+
+维度	容器隔离的 cgroup
+它是什么	在 cgroup 树上专门给某个容器创建的一个节点（一个目录）
+干什么用	节点里的限制文件给容器进程封顶资源用量
+怎么实现的	容器运行时 mkdir /sys/fs/cgroup/<父>/<容器名>/ + 写文件
+跟 cgroup 树啥关系	它就是 cgroup 树上的一个节点，不是另一个独立东西
+所以更准确的说法是：
+
+"容器隔离用的 cgroup" = "在 cgroup 树里，专门为这个容器开辟的一个节点"
+
+而不是"另一个 cgroup"。整台机器上只有一棵 cgroup 树，systemd 服务、用户会话、所有容器全都挂在这棵树的不同分支上。
+
+五、一图对照三个相关概念
+经常容易混的三件事：
+
+名称	是什么	跟容器的关系
+cgroup 树	/sys/fs/cgroup/ 下的整棵目录树	容器的 cgroup 节点是这棵树上的一根树枝
+容器的 cgroup	这棵树上专门给某个容器创建的节点	容器隔离三件套之一：资源隔离
+cgroup namespace	一种 namespace，遮蔽 /proc/self/cgroup 显示的路径	让容器看不见自己在树上的真实位置（视野遮蔽）
+第一个是结构，第二个是用法，第三个是视野遮罩。三者结合才是 K8s 容器场景下的完整图景：
+
+cgroup 树：内核维护的全局资源管控结构
+容器的 cgroup：树上分给该容器的那个节点（决定它实际能用多少资源）
+cgroup namespace：让容器看不见自己在树里的位置（决定它以为自己在哪）
+一句话本质
+cgroup 树是 Linux 内核组织资源管控的整体结构，容器隔离的 cgroup 只是这棵树上专为某个容器开辟的一个节点——名字叫 cgroup 因为它就是这棵树的一员。它们不是两个东西，是同一棵树的"全图"和"局部"。
