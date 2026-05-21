@@ -82,6 +82,13 @@ func (s *RuntimeService) CreateContainer(_ context.Context, req *runtime.CreateC
 		return nil, fmt.Errorf("prepare rootfs for image %s: %w", imgName, err)
 	}
 
+	// 在 bind mount 之前生成 /etc/{resolv.conf,hosts,hostname}：
+	// 一来 bind mount 可能用 configmap 覆盖这几个文件（典型场景：CoreDNS Corefile），
+	// 二来 CoreDNS 起来必须能读 resolv.conf，否则 forward 插件初始化失败。
+	if err := writeContainerEtcFiles(mergedRoot, sb); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: write /etc files for %s: %v\n", id, err)
+	}
+
 	// Apply bind mounts from CRI config (hostPath volumes, configMaps, secrets, etc.)
 	if len(cfg.Mounts) > 0 {
 		for _, m := range cfg.Mounts {

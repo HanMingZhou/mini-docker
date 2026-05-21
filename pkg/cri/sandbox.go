@@ -28,6 +28,23 @@ func (s *RuntimeService) RunPodSandbox(_ context.Context, req *runtime.RunPodSan
 		}
 	}
 
+	// /etc/* 输入：从 PodSandboxConfig 抽取 hostname / DNS / hostAliases。
+	// 这些原本只活在 sandbox 元数据里，CreateContainer 阶段写入容器 rootfs。
+	hostname := req.Config.Hostname
+	if hostname == "" {
+		hostname = md.Name // 兜底：用 Pod 名当 hostname
+	}
+	var dns sandbox.DNSConfig
+	if req.Config.DnsConfig != nil {
+		dns = sandbox.DNSConfig{
+			Servers:  append([]string(nil), req.Config.DnsConfig.Servers...),
+			Searches: append([]string(nil), req.Config.DnsConfig.Searches...),
+			Options:  append([]string(nil), req.Config.DnsConfig.Options...),
+		}
+	}
+	hostAliases := make([]sandbox.HostAlias, 0, 0)
+	// CRI v1 没有 hostAliases 字段（K8s 通过 /etc/hosts mount 实现），保留扩展位。
+
 	sb, err := s.sandboxMgr.StartWithOptions(
 		sandbox.Metadata{
 			Name:      md.Name,
@@ -41,6 +58,9 @@ func (s *RuntimeService) RunPodSandbox(_ context.Context, req *runtime.RunPodSan
 			Annotations:  req.Config.Annotations,
 			CgroupParent: cgroupParent,
 			HostNetwork:  hostNetwork,
+			Hostname:     hostname,
+			DNS:          dns,
+			HostAliases:  hostAliases,
 		},
 	)
 	if err != nil {

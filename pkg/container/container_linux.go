@@ -82,6 +82,10 @@ func start(cfg Config) (*Handle, error) {
 
 	// stdio：detach -> 日志文件；前台 tty -> 当前终端；否则继承 stdout/err
 	var extraClosers []func() error
+	// criWriteEnds tracks the parent-side write ends of CRI log pipes. After
+	// cmd.Start() the child has dup'd these fds; the parent must close its
+	// copies, otherwise the pump goroutines never see EOF on container exit.
+	var criWriteEnds []*os.File
 	if cfg.Detach {
 		logDir := filepath.Dir(cfg.LogPath)
 		if err := os.MkdirAll(logDir, 0755); err != nil {
@@ -89,17 +93,51 @@ func start(cfg Config) (*Handle, error) {
 			return nil, fmt.Errorf("mkdir log dir: %w", err)
 		}
 		if cfg.CRILog {
-			// 直接用文件作为 stdout/stderr，避免 Go 的 pipe 机制。
-			// CRI 日志格式由一个包装进程处理（后续优化），当前先保证容器稳定。
+			// CRI 日志格式（kubelet/kubectl logs 必需）：
+			//   <RFC3339Nano> <stream> <P|F> <line>\n
+			// 容器 stdout/stderr 是裸文本（如 nginx 的 ".:53\n"），
+			// 直接写文件会让 kubelet 解析失败：
+			//   "unsupported log format: \".:53\\n\""
+			// 解法：父进程为 stdout/stderr 各开一个 pipe，goroutine 从 pipe
+			// 读行 → 加 RFC3339+stream+tag → 写日志文件。
 			logFile, err := os.OpenFile(cfg.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 			if err != nil {
 				_ = w.Close()
 				return nil, fmt.Errorf("open log file: %w", err)
 			}
+			logger := newCRILogger(logFile)
+			outR, outW, perr := os.Pipe()
+			if perr != nil {
+				_ = w.Close()
+				_ = logFile.Close()
+				return nil, fmt.Errorf("create stdout pipe: %w", perr)
+			}
+			errR, errW, perr := os.Pipe()
+			if perr != nil {
+				_ = w.Close()
+				_ = logFile.Close()
+				_ = outR.Close()
+				_ = outW.Close()
+				return nil, fmt.Errorf("create stderr pipe: %w", perr)
+			}
 			cmd.Stdin = nil
-			cmd.Stdout = logFile
-			cmd.Stderr = logFile
-			extraClosers = append(extraClosers, logFile.Close)
+			cmd.Stdout = outW
+			cmd.Stderr = errW
+			criWriteEnds = []*os.File{outW, errW}
+
+			// goroutine 把容器 stdout/stderr 转成 CRI 格式写到 logFile。
+			done := make(chan struct{}, 2)
+			go func() { logger.pumpStream(outR, criStreamStdout); done <- struct{}{} }()
+			go func() { logger.pumpStream(errR, criStreamStderr); done <- struct{}{} }()
+
+			// 在 Wait 后再 close logFile：先等两个 pump 排空管道。
+			extraClosers = append(extraClosers, func() error {
+				<-done
+				<-done
+				_ = outR.Close()
+				_ = errR.Close()
+				return logFile.Close()
+			})
 		} else {
 			logFile, err := os.OpenFile(cfg.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 			if err != nil {
@@ -124,6 +162,12 @@ func start(cfg Config) (*Handle, error) {
 	if err := cmd.Start(); err != nil {
 		_ = w.Close()
 		return nil, fmt.Errorf("start init process: %w", err)
+	}
+
+	// 关键：os/exec 把 cmd.Stdout/Stderr 的 *os.File dup 给子进程后，父进程
+	// 仍然持有原 fd。如果不关掉，pump goroutine 永远收不到 EOF，Wait 会卡住。
+	for _, fd := range criWriteEnds {
+		_ = fd.Close()
 	}
 
 	// 创建 cgroup（写文件，比如 /sys/fs/cgroup/mydocker/<name>/）
