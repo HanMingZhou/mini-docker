@@ -1413,3 +1413,448 @@ CoreDNS Pod 挂一个：另一个还在，VIP 自动切。
                        ↑
                  永远没有"数据丢失"——数据从来不在 CoreDNS 里
 ```
+
+## 十、mini-docker 的两种身份
+
+mini-docker 其实是两个可执行文件，对应两种使用方式：
+
+```text
+bin/
+├── mydocker        ← Docker-like CLI（命令行容器工具）
+└── mydocker-cri    ← CRI 运行时（gRPC daemon，给 Kubelet 用）
+```
+
+### 1. 身份 A：Docker 替代品（mydocker）
+
+像 Docker CLI 一样用：
+
+```bash
+sudo mydocker pull nginx
+sudo mydocker run -d --image nginx -p 8080:80 nginx
+sudo mydocker ps
+sudo mydocker exec <id> sh
+sudo mydocker logs <id>
+sudo mydocker rm -f <id>
+```
+
+用户视角：跟 docker 命令一模一样，自己直接用。
+
+### 2. 身份 B：CRI 运行时（mydocker-cri）
+
+像 containerd / cri-o 一样，作为 K8s 的容器运行时：
+
+```bash
+# 启动 daemon
+sudo mydocker-cri serve --socket /var/run/mydocker-cri.sock
+
+# 然后 Kubelet 通过 CRI 协议（gRPC over Unix socket）调它
+# 也可以用 crictl 调试：
+sudo crictl --runtime-endpoint unix:///var/run/mydocker-cri.sock pods
+sudo crictl --runtime-endpoint unix:///var/run/mydocker-cri.sock images
+```
+
+K8s 视角：mydocker-cri 是 containerd 的替代品，Kubelet 不知道它是谁，只知道"这是个实现了 CRI 协议的运行时"。
+
+### 3. mini-docker 在容器生态里的位置
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│                       Kubernetes (orchestrator)               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │   Kubelet  ←─── 节点 agent                              │  │
+│  └────────────┬────────────────────────────────────────────┘  │
+│               │ CRI (gRPC)                                    │
+│               ▼                                               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │   CRI 运行时层                                          │  │
+│  │   containerd / cri-o / docker-shim / mydocker-cri ◄─────┼──┼── 你的项目（身份 B）
+│  │                                                         │  │
+│  │   它向下用 OCI 运行时启动容器                           │  │
+│  └────────────┬────────────────────────────────────────────┘  │
+│               │ OCI runtime spec                              │
+│               ▼                                               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │   OCI 运行时层                                          │  │
+│  │   runc / crun / gVisor                                  │  │
+│  │   （或者 mini-docker 自己内嵌的 namespace/cgroup 调用） │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────┘
+
+旁路：用户直接命令行
+
+┌─────────────────────────────────────────────────────────────┐
+│   用户  ──►  docker CLI                                     │
+│   用户  ──►  podman                                         │
+│   用户  ──►  mydocker  ◄────────────────────────────────────┼── 你的项目（身份 A）
+│                  │                                          │
+│                  └─► 同样调用 namespace/cgroup 起容器        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+mini-docker 同时占据两个槽位——这就是它学习价值最大的点：你能看到从"用户命令行"到"K8s CRI"两条路径用同一套底层代码实现。
+
+### 4. 自底向上的容器运行时
+
+严格来说，它是一个完整的、自底向上、自包含的容器运行时。
+
+| 层               | 标准做法                  | mini-docker 做法                               |
+| ---------------- | ------------------------- | ---------------------------------------------- |
+| 镜像管理         | containerd image / skopeo | `pkg/image`                                    |
+| OverlayFS rootfs | containerd snapshotter    | `pkg/image.PrepareRootfs`                      |
+| 容器进程         | runc（外部 OCI 二进制）   | 直接在 Go 里调 namespace/cgroup（不依赖 runc） |
+| CRI gRPC         | containerd 的 CRI 插件    | `pkg/cri/*`                                    |
+| CNI 网络         | containerd 调 CNI 插件    | `pkg/network` 调 CNI 插件                      |
+| CLI              | docker / crictl           | `cmd/mydocker`                                 |
+
+和 containerd 的最大区别：containerd 通过 runc 这个独立二进制起容器（fork/exec runc）；mydocker 进程内直接做 namespace/cgroup（看 `pkg/container` 和 init 子命令）——更像 LXC/podman 的某些模式。
+
+更准确的一句话：
+
+mini-docker 既是 Docker-like CLI，也是 CRI 运行时。两者共享同一套底层（镜像、rootfs、namespace、cgroup、CNI），只是入口不同：
+
+- `mydocker` = 直接给用户用的 CLI（替代 docker）。
+- `mydocker-cri` = gRPC daemon（替代 containerd），给 Kubelet 用。
+
+前面所有 K8s/CRI 讨论（RunPodSandbox / DnsConfig / writeContainerEtcFiles 这些），都是身份 B——mydocker-cri 这个 daemon 实现 CRI 协议时的代码路径。
+
+
+## 十一、crictl 是什么，和 kubectl 有什么关系
+
+简短回答：没关系，是两个不同层级的工具。一个对接 K8s 控制面，一个对接节点容器运行时。
+
+### 1. crictl vs kubectl
+
+| 维度     | kubectl                                        | crictl                                           |
+| -------- | ---------------------------------------------- | ------------------------------------------------ |
+| 对接谁   | K8s API Server                                 | 节点上的 CRI 运行时（containerd / mydocker-cri） |
+| 协议     | HTTP/HTTPS REST                                | gRPC over Unix socket                            |
+| 端点     | `https://master:6443`                          | `unix:///var/run/containerd/containerd.sock`     |
+| 跨节点   | 可以管整个集群                                 | 只能管本机                                       |
+| 管的对象 | Pod、Deployment、Service、ConfigMap 等抽象资源 | Pod sandbox、容器、镜像（CRI 层的"原始"对象）    |
+| 谁能用   | 任何机器（只要有 kubeconfig）                  | 必须在节点上（root + socket 权限）               |
+| 设计目的 | 给开发者/运维操作集群                          | 给运行时实现者调试                               |
+
+### 2. 层级图
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│         开发者电脑 / 跳板机                                  │
+│         $ kubectl get pods   ────────┐                     │
+└──────────────────────────────────────┼─────────────────────┘
+                                       │ HTTPS
+                                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  K8s 控制面（master）                                        │
+│   ┌────────────┐    ┌──────────┐    ┌─────────┐            │
+│   │ API Server │ ←─►│   etcd   │    │Scheduler│            │
+│   └────────────┘    └──────────┘    └─────────┘            │
+└────────┬─────────────────────────────────────────────────────┘
+         │ Pod 应该跑在 node-1
+         ▼
+┌──────────────────────────────────────────────────────────────┐
+│  worker node-1                                               │
+│   ┌────────────┐                                             │
+│   │  Kubelet   │  ◄─── 收到任务："起一个 Pod"                │
+│   └─────┬──────┘                                             │
+│         │ CRI (gRPC over Unix socket)                        │
+│         ▼                                                    │
+│   ┌────────────────────┐                                     │
+│   │ containerd /       │  ◄─── 你也可以用 crictl 直接调它     │
+│   │ mydocker-cri       │       $ crictl ps                   │
+│   └─────┬──────────────┘       $ crictl pods                 │
+│         │                                                    │
+│         ▼                                                    │
+│      容器进程                                                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+关键洞察：
+
+- `kubectl` 在最上层，跟 etcd 里的"愿望"打交道（"我想要 3 个 nginx Pod"）。
+- `crictl` 在最底层，跟节点上真实跑着的东西打交道。
+- Kubelet 是中间的翻译官，把上层意图翻译成 CRI 调用。
+
+### 3. 典型命令对照
+
+| 你想做的事 | kubectl（集群视角）                 | crictl（节点视角）                 |
+| ---------- | ----------------------------------- | ---------------------------------- |
+| 列出 Pod   | `kubectl get pods -A`               | `crictl pods`                      |
+| 列出容器   | `kubectl get pods` 然后看 READY     | `crictl ps -a`                     |
+| 看容器日志 | `kubectl logs <pod> -c <container>` | `crictl logs <containerID>`        |
+| 进容器     | `kubectl exec -it <pod> -- sh`      | `crictl exec -it <containerID> sh` |
+| 列镜像     | `kubectl get pods -o ...` 间接看    | `crictl images`                    |
+| 拉镜像     | 没有（K8s 自动拉）                  | `crictl pull nginx`                |
+| 删 Pod     | `kubectl delete pod <name>`         | `crictl rmp <podID>`（危险）       |
+
+注意：
+
+- `kubectl delete pod` → K8s 控制面记账 → Deployment 控制器会重新创建一个新 Pod。
+- `crictl rmp` → 只删本机这个实例 → K8s 不知道，会以为这个 Pod 还在，状态会乱。
+
+所以 crictl 是底层调试工具，正常运维用 kubectl。
+
+### 4. crictl 和本项目的关系
+
+项目里 crictl 出现在两个地方。
+
+第一，配置文件指向 mydocker-cri：
+
+```bash
+sudo tee /etc/crictl.yaml >/dev/null <<'EOF'
+runtime-endpoint: unix:///var/run/mydocker-cri.sock
+image-endpoint: unix:///var/run/mydocker-cri.sock
+timeout: 10
+EOF
+```
+
+这告诉 crictl："你去敲 mydocker-cri 这个 socket，不要默认敲 containerd"。
+
+第二，项目用 crictl 做冒烟测试：
+
+```yaml
+smoke:l3:
+  desc: L3 CRI 冒烟（sandbox / image / container / exec）
+  preconditions:
+    - sh: '[ "$(go env GOOS)" = "linux" ]'
+      msg: smoke:l3 仅可在 Linux 上运行
+  cmds:
+    - sudo bash scripts/smoke-l3.sh
+```
+
+`smoke-l3.sh` 大概率就是用 crictl 调 mydocker-cri 的各个 RPC（RunPodSandbox / PullImage / CreateContainer），验证 CRI 实现行为符合协议。这是不依赖 Kubelet 验证 CRI 实现的标准做法。
+
+### 5. crictl 是怎么和 mydocker-cri 对话的
+
+跟前面讲的"Kubelet 是 client，mydocker-cri 是 server"完全一样：
+
+```text
+$ sudo crictl pods
+   │
+   ├─ 读 /etc/crictl.yaml 拿到 socket 路径
+   ├─ grpc.Dial("unix:///var/run/mydocker-cri.sock")
+   ├─ runtime.NewRuntimeServiceClient(conn)
+   ├─ client.ListPodSandbox(ctx, &ListPodSandboxRequest{})
+   │     │
+   │     └─► HTTP/2 over Unix socket
+   │              │
+   │              ▼
+   │     mydocker-cri 路由表查 "/runtime.v1.RuntimeService/ListPodSandbox"
+   │     ──► 命中 s.runtime.ListPodSandbox
+   │     ──► 读 sandboxes/*/config.json
+   │     ──► 返回 list
+   │
+   └─ 收到响应，格式化成表格输出
+```
+
+crictl 就是个 CRI client 实现，跟 Kubelet 是 client 这件事一模一样。可以把它想成"CRI 的 curl"——任何 CRI server 都能用它调试。
+
+### 6. 记忆口诀
+
+| 维度   | kubectl                    | crictl                      |
+| ------ | -------------------------- | --------------------------- |
+| 一句话 | "管 K8s 集群"              | "管节点上的运行时"          |
+| 类比   | 像 git                     | 像 strace                   |
+| 谁用   | 开发者、运维               | 运行时实现者、SRE 排查问题  |
+| 在哪用 | 任何机器                   | 节点上                      |
+| 看到的 | Pod / Service / Deployment | sandbox / container / image |
+
+### 7. 什么时候用哪个
+
+- 业务运维：99% 用 kubectl。
+- 节点排查："Pod 一直 Pending，到底容器有没有被创建？" → `crictl ps -a` 看运行时层有没有动作。
+- 开发 CRI 运行时（本项目）：crictl 是主要调试工具，因为它能在不需要 Kubelet 的情况下调所有 RPC。
+
+经典排查场景：
+
+```bash
+# Pod 一直 ContainerCreating
+kubectl describe pod my-pod
+
+# 上面说 "PullImage failed"
+# 那就到那个节点上手动复现拉镜像：
+crictl pull <image>
+```
+
+一句话总结：
+
+kubectl 跟 K8s 控制面对话（集群视角），crictl 跟节点上的 CRI 运行时对话（节点视角）。它们不互相依赖——你可以只装 crictl 没有 K8s（用来调试 mydocker-cri），也可以只用 kubectl 不碰 crictl（正常运维）。两者一起用是"集群级排查 + 节点级排查"的组合拳。
+
+## 十二、crictl 不是真正干活的
+
+crictl 不是干活的——它只是个"遥控器"。
+
+crictl 本身不创建容器、不管理进程、不挂载文件系统。它只是个 CRI 协议的 client——把你的命令翻译成 gRPC 请求，发给真正干活的 CRI 运行时。
+
+### 1. 谁真正在干活
+
+```text
+你输入命令
+   ↓
+$ crictl pull nginx
+   ↓ （crictl 只做这一件事：把命令翻译成 gRPC）
+[gRPC] PullImage(image="nginx") ─────────────► Unix socket
+                                                   │
+                                                   ▼
+                                  ┌──────────────────────────────┐
+                                  │  mydocker-cri / containerd   │ ← 真正干活的
+                                  │                              │
+                                  │  • HTTP 连 registry          │
+                                  │  • 下载 layer tarball        │
+                                  │  • 解压到 /var/lib/...       │
+                                  │  • 写 manifest 索引          │
+                                  └──────────────────────────────┘
+                                                   ↓
+                                          磁盘上多了镜像
+   ↑                                              ↑
+   │ 返回响应                                     │
+   └──────────────────────────────────────────────┘
+```
+
+crictl 自己：发完请求就等着收响应、打印到屏幕。没有它，运行时一样在干活（Kubelet 也是 client，照样能调）。
+
+
+把 crictl 卸载了，container 该跑还跑——因为 Kubelet 才是日常调它的 client。
+
+### 2. 回到本项目：谁是干活的
+
+mydocker-cri 才是干活的。它是一个常驻 daemon 进程：
+
+```bash
+# 你启动它（systemd / 手动）
+sudo mydocker-cri serve --socket /var/run/mydocker-cri.sock
+
+# 它就开始监听 socket，等 client 来连
+```
+
+干活的地方在 mydocker-cri 进程内部，比如：
+
+```go
+mergedRoot, err := imgStore.PrepareRootfs(imgName, containerDir) // 真正在 overlayfs 挂镜像
+if err != nil {
+    _ = os.RemoveAll(containerDir)
+    return nil, fmt.Errorf("prepare rootfs for image %s: %w", imgName, err)
+}
+
+// 在 bind mount 之前生成 /etc/{resolv.conf,hosts,hostname}：
+// 一来 bind mount 可能用 configmap 覆盖这几个文件（典型场景：CoreDNS Corefile），
+// 二来 CoreDNS 起来必须能读 resolv.conf，否则 forward 插件初始化失败。
+if err := writeContainerEtcFiles(mergedRoot, sb); err != nil { // 真正在写文件
+    fmt.Fprintf(os.Stderr, "warn: write /etc files for %s: %v\n", id, err)
+}
+```
+
+这些代码在 mydocker-cri 进程里运行，不是在 crictl 进程里。
+
+### 3. 三方角色完整列表
+
+```text
+┌──────────────┐        ┌──────────────┐        ┌──────────────────────┐
+│   crictl     │        │   Kubelet    │        │   你写的测试脚本     │
+│  （调试用）  │        │ （K8s 节点） │        │  （直接用 gRPC 库）  │
+└──────┬───────┘        └──────┬───────┘        └───────────┬──────────┘
+       │                       │                            │
+       │  全都是 client，发 gRPC 请求                        │
+       └───────────────────────┴────────────────────────────┘
+                               │
+                               ▼ Unix socket
+                  ┌────────────────────────────┐
+                  │   mydocker-cri  (server)   │ ← 真正干活
+                  │                            │
+                  │   • 拉镜像                 │
+                  │   • 创建 namespace         │
+                  │   • 写 cgroup              │
+                  │   • 调 CNI                 │
+                  │   • bind mount             │
+                  │   • fork 子进程            │
+                  └────────────────────────────┘
+```
+
+crictl、Kubelet、你的脚本是可以互相替换的 client——都能调 mydocker-cri。但 mydocker-cri 是唯一干活的那个。
+
+### 4. 一个具体证明：关掉 crictl 系统还在跑
+
+```bash
+# 假设 K8s 集群正常运行
+sudo systemctl status kubelet
+sudo systemctl status containerd
+
+# 把 crictl 删了
+sudo rm /usr/local/bin/crictl
+
+# 集群该跑还跑——因为 Kubelet 才是日常调 CRI 的 client
+kubectl get pods
+```
+
+反过来：
+
+```bash
+sudo systemctl stop containerd
+
+# 停了真干活的，立刻：
+kubectl get pods  # 节点变 NotReady
+sudo crictl ps    # 连不上 socket，报错
+```
+
+### 5. crictl 存在的意义
+
+- 手动调试 CRI 运行时是否正常（不依赖 Kubelet）。
+- 验证 CRI 实现（项目里 `smoke-l3.sh` 就用它）。
+- 排查节点问题（Kubelet 卡了，crictl 还能直接问运行时）。
+- K8s 圈的"通用 client"——任何符合 CRI 协议的运行时都能用同一个 crictl 调。
+
+但它自己不干活，就像 curl 自己不是 web server。
+
+一句话回到问题：
+
+不是。crictl 是个 client（遥控器），真正干活的是 mydocker-cri（daemon 进程）。`crictl pull nginx` 时，下载、解压、写磁盘这些操作全部发生在 mydocker-cri 进程里——crictl 只是发了个 gRPC 请求等响应。
+
+
+
+### 6. CRI 协议本质上就是定义了两个 gRPC Service：
+```go
+service RuntimeService {
+    // Sandbox 生命周期
+    rpc RunPodSandbox(...)
+    rpc StopPodSandbox(...)
+    rpc RemovePodSandbox(...)
+    rpc PodSandboxStatus(...)
+    rpc ListPodSandbox(...)
+
+    // 容器生命周期
+    rpc CreateContainer(...)
+    rpc StartContainer(...)
+    rpc StopContainer(...)
+    rpc RemoveContainer(...)
+    rpc ListContainers(...)
+    rpc ContainerStatus(...)
+
+    // 其他：exec、attach、port-forward、stats...
+    rpc ExecSync(...)
+    rpc Exec(...)
+    rpc Attach(...)
+}
+
+service ImageService {
+    rpc PullImage(...)
+    rpc ListImages(...)
+    rpc RemoveImage(...)
+    rpc ImageStatus(...)
+    rpc ImageFsInfo(...)
+}
+```
+CRI Runtime = 实现了这两个 Service 的进程。 kubelet 通过 unix socket 连过来发 gRPC 请求，你的程序响应这些请求就行。
+
+对应到你的 mydocker 项目：
+
+CRI Service	你的代码	干的事
+RuntimeService	
+sandbox.go
+ + 
+container.go
+创建/停止 sandbox 和容器
+ImageService	
+image.go
+拉取/列出/删除镜像
+gRPC Server	
+server.go
+监听 socket，注册两个 Service
