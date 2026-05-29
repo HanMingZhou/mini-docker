@@ -1526,3 +1526,167 @@ K8s 必须由 Kubelet 决定：
 Kubelet 把所有 Pod 组织成 kubepods/<QoS>/pod<uid> 这样的层级，CRI 实现必须照办，否则 Kubelet 没法做总体资源核算（节点级 reservation、QoS 强制）。
 cgroup driver 必须和 Kubelet 一致，否则 systemd 和 cgroupfs 各写一份就乱套了（这是 K8s 排查频率最高的坑之一，你的 scripts/kubelet-integration.md 里也提到了）。
 所以这两个字段在 container.Config 里存在，是为 CRI 服务的；CLI 模式下它们是"没用但要留着"的占位。
+
+
+---
+
+# Runc
+
+## 一、容器的本质
+
+容器 = 一个普通的 Linux 进程 + 三件套包装：
+
+| 组件 | 作用 | 关键技术 |
+|------|------|---------|
+| **Namespace** | 隔离视野（看不到外面） | pid / net / mnt / uts / ipc / user / cgroup |
+| **Cgroup** | 限制资源（CPU、内存等） | /sys/fs/cgroup 下的目录树 |
+| **Rootfs** | 切换根目录（看到不同的文件系统） | overlay + pivot_root |
+
+记住：**namespace 管"看到什么"，cgroup 管"能用多少"，rootfs 管"在哪儿"**。
+
+---
+
+## 二、双进程启动模型
+
+```
+父进程 (mydocker run)                  子进程 (mydocker init)
+─────────────────────                  ─────────────────────
+1. os.Pipe() 建管道
+2. exec.Command(self, "init")
+   + Cloneflags 新 namespace
+3. cmd.Start() ──→ 内核 clone ──→ 出生在新 ns 里
+                                    阻塞读 pipe ⏸
+4. cgroup 创建 + AddProc(子PID)
+5. CNI 配网络
+6. 通过 pipe 发 payload ──────→ 解除阻塞
+7. 返回 Handle                      7a. setns 加入 sandbox ns
+                                    7b. sethostname
+                                    7c. pivot_root 换根
+                                    7d. 挂 /proc /sys /dev
+                                    7e. syscall.Exec 变身用户命令
+```
+
+**为什么子进程要先卡住？** 因为 cgroup 加 PID、CNI 配网络这些事必须父进程做（子进程在新 PID ns 里看不到自己的真实 PID），但又必须等子进程已经在新 namespace 里之后才有意义。pipe 阻塞读就是同步机制。
+
+---
+
+## 三、关键技术点速记
+
+### 1. 父子通信：FD 3 + 管道
+
+- 父进程：`cmd.ExtraFiles = []*os.File{r}`
+- 子进程：通过 `os.NewFile(3, ...)` 拿到管道读端
+- Go 在子进程 fork 后用 `dup2` 强制让管道变成 FD 3
+
+### 2. clone flags 的两种用法
+
+| 场景 | 处理 |
+|------|------|
+| 普通容器：建独立 ns | `Cloneflags |= CLONE_NEWPID|CLONE_NEWNET|...` |
+| Pod 容器：加入沙箱 ns | 从 Cloneflags 里 `clearCloneFlag` 去掉对应位，子进程用 `setns` 加入 |
+
+### 3. pivot_root 换根七步
+
+| 步 | 做什么 | 为什么 |
+|----|--------|--------|
+| 0 | mount("", "/", "", MS_PRIVATE\|MS_REC) | 防止挂载传播泄漏到宿主机 |
+| 1 | mount --bind newRoot newRoot | 让 newRoot 成为合法挂载点 |
+| 2 | mkdir newRoot/.pivot_root | 给老根准备安放位置 |
+| 3 | pivot_root(newRoot, .pivot_root) | 真正换根 |
+| 4 | chdir("/") | 把 cwd 也搬到新根 |
+| 5 | umount(/.pivot_root) + 删除 | 抹掉宿主机老根，防逃逸 |
+| 6 | 挂 /proc /sys /dev | 镜像里这些目录是空的 |
+
+### 4. cgroup v2 操作模式
+
+cgroup 就是文件系统：
+
+| 操作 | 等价 shell |
+|------|-----------|
+| 创建 cgroup | `mkdir /sys/fs/cgroup/.../<name>` |
+| 启用控制器 | `echo "+memory" > .../cgroup.subtree_control`（**父级必须先 enable**）|
+| 限制内存 | `echo 100M > memory.max` |
+| 限制 CPU | `echo "50000 100000" > cpu.max`（每 100ms 用 50ms = 半核）|
+| 加入进程 | `echo <pid> > cgroup.procs` |
+| 销毁 cgroup | `rmdir .../<name>`（必须没进程才能删）|
+
+### 5. cgroup 树 vs cgroup namespace
+
+- **cgroup 树**：目录嵌套形成的层级结构，用来表达"组的组"配额（K8s QoS 就靠这个）
+- **cgroup namespace**：让容器里 `cat /proc/self/cgroup` 看到 `/` 而不是宿主路径。**不是为了防偷看**，而是让容器内工具（Java/Go runtime）能正确读到自己的 cgroup 文件
+
+### 6. overlay 和 pivot_root 的协作
+
+```
+父进程: overlay mount → merged 目录（多层镜像合一）
+                         ↓
+父进程: ApplyBindMounts → volume 挂到 merged/<target>
+                         ↓
+父进程: fork(CLONE_NEWNS) → 子进程继承挂载树
+                         ↓
+子进程: pivot_root(merged) → merged 变成 /，volume 自动出现
+```
+
+**两个 bind mount 的不同用途**：
+
+| 类型 | 谁做 | 目的 |
+|------|------|------|
+| self-bind（merged 绑自己）| 子进程 | 让 merged 100% 是合法挂载点，满足 pivot_root 前置条件 |
+| volume-bind（宿主路径绑到 merged/x）| 父进程 | 子进程 pivot_root 后看不到宿主路径，必须父进程提前挂 |
+
+---
+
+## 四、initProcess 的"灵魂替换"
+
+```go
+syscall.Exec(bin, payload.Cmd, envSlice)
+```
+
+`syscall.Exec` = `execve(2)` 系统调用。**它不是 fork+exec，而是把当前进程的内存映像直接替换掉**：
+
+- PID 不变
+- namespace 不变
+- cgroup 归属不变
+- 但里面跑的代码完全变了（从 mydocker init 变成 /bin/sh 之类）
+
+从这一刻起，这个进程就是用户的程序，Go runtime 完全消失。**容器就"诞生"了**。
+
+---
+
+## 五、CgroupParent / CgroupDriver 的双重身份
+
+| 入口 | CgroupParent | CgroupDriver |
+|------|--------------|--------------|
+| CLI（mydocker run）| 不赋值，零值 `""` → 落到 `/sys/fs/cgroup/<name>` | 不赋值，自动探测 |
+| CRI（K8s）| Kubelet 通过 gRPC 传，形如 `kubepods/burstable/pod<uid>` | mydocker-cri 启动参数 `--cgroup-driver`，必须和 Kubelet 一致 |
+
+**为什么 CRI 必须由 Kubelet 决定？** Kubelet 用 cgroup 树做节点级资源核算和 QoS 强制，CRI 实现必须配合。driver 不一致是 K8s 集群最高频的坑之一。
+
+---
+
+## 六、术语对照速查
+
+| 术语 | 通俗解释 |
+|------|---------|
+| clone flags | fork 时让内核顺便创建哪些新 namespace 的开关位 |
+| pivot_root | 把进程的根目录换成另一个目录（chroot 的安全升级版） |
+| setns | 让当前进程"跳进"另一个已存在的 namespace |
+| netns | network namespace 简写（独立网卡/路由/iptables） |
+| CNI | 容器网络接口标准，给容器配 IP 和网线 |
+| cgroup | 资源限制机制，本质是 /sys/fs/cgroup 下的文件系统 |
+| FD | File Descriptor，进程里打开资源的整数编号（0=stdin, 1=stdout, 2=stderr）|
+| pipe | 内核里的缓冲区，进程间通信 |
+| bind mount | 把一个目录"复制挂载"到另一个位置（同一份数据两个入口）|
+| overlay | 联合文件系统，把多层只读镜像 + 一层可写层合并成一个目录 |
+| detach | 后台模式，父进程启动完就放手 |
+| TTY | 终端设备，前台模式下容器 stdio 接到用户终端 |
+| payload | 载荷，要传递的数据本身 |
+| QoS | Quality of Service，K8s 的资源服务等级（Guaranteed/Burstable/BestEffort）|
+
+---
+
+## 七、一句话回顾全流程
+
+> **父进程用 clone 开一个套着新 namespace 的子进程让它先卡住 → 父进程在外面给它配好 cgroup 和网络 → 通过管道发指令 → 子进程做 pivot_root 换根 → 然后 exec 成用户命令。容器就跑起来了。**
+
+整个过程的精髓：**让用户进程一启动时，所有的隔离（ns）、限制（cgroup）、视野（rootfs）、网络都已就绪**。这就是 Docker、runc、containerd、mini-docker 共同遵循的设计哲学。
